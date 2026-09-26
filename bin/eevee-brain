@@ -1,0 +1,725 @@
+#!/bin/bash
+# Eevee's brain. The QML side only animates and renders; everything that
+# needs judgement lives here so it can be tested from a terminal:
+#
+#   eevee-brain sense            one sensing tick -> "mood<TAB>message" lines
+#   eevee-brain context          plain-text snapshot of the desktop
+#   eevee-brain ask <question>   answer via Claude (keeps a short-lived session)
+#   eevee-brain launch <app|url> open (or focus, if already open) an app or URL
+#   eevee-brain apps [filter]    list installed apps
+#   eevee-brain open <request>   launch; if nothing matches, let Claude pick
+#   eevee-brain reset            forget the chat session
+#   eevee-brain evolve [form]    evolve now (random fitting form if omitted)
+#   eevee-brain devolve          turn back into Eevee
+#   eevee-brain pet              record a pet (affection -> Sylveon)
+#   eevee-brain screen           "<fullscreen 0|1> <recording 0|1>" for the sprite
+#   eevee-brain remember <fact>  keep a fact across chats (forget [text] drops)
+#   eevee-brain lockscreen [on|off|status]   Eevee napping on the lock screen
+#                                (needs the Lock Designs plugin)
+#   eevee-brain hover            JSON system snapshot for the hover card
+#   eevee-brain cmd-done <secs> <status> <shell pid> <command>
+#                                (from shell/eevee-hook.bash) notify when a
+#                                long command finishes in a window you left
+#   eevee-brain cmdhook [on|off|status]  install that hook in ~/.bashrc
+#
+# Settings live inline on the plugin's entry in ~/.config/omarchy/shell.json
+# (edited from the settings window, /settings in the chat box).
+#
+# Moods understood by the sprite: happy, alert, sleepy, think, calm, plus
+# type events that make a Pokémon of that type attack: hot (fire), spooky
+# (ghost/dark), refresh (water), morning (grass), cool (ice).
+# A "form<TAB>name<TAB>message" line from sense tells the sprite which
+# Eeveelution to show; the message is only set when the form changes.
+# A "friend<TAB>level" line reports the friendship level.
+
+set -u
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/eevee"
+RUN="${XDG_RUNTIME_DIR:-/tmp}/eevee"
+mkdir -p "$STATE" "$RUN"
+chmod 700 "$RUN"
+
+SESSION_TTL=1800 # a chat older than 30 min starts fresh
+
+# Settings: the plugin's entry in shell.json, read once per run.
+PLUGIN_DIR="$(dirname "$(dirname "$(readlink -f "$0")")")"
+PLUGIN_ID=$(jq -r '.id // empty' "$PLUGIN_DIR/manifest.json" 2>/dev/null)
+PLUGIN_ID=${PLUGIN_ID:-rafa.desktop-buddy}
+declare -A CFG=()
+while IFS=$'\t' read -r k v; do
+  [[ -n $k ]] && CFG[$k]=$v
+done < <(jq -r --arg id "$PLUGIN_ID" \
+  '.plugins[]? | select(.id == $id) | to_entries[] | select(.key != "id") | "\(.key)\t\(.value)"' \
+  "$HOME/.config/omarchy/shell.json" 2>/dev/null)
+setting() { local v="${CFG[$1]-}"; echo "${v:-$2}"; }  # setting <key> <default>
+enabled() { [[ $(setting "$1" "$2") == true ]]; }     # enabled <key> <true|false>
+
+CLAUDE_MODEL="${EEVEE_MODEL:-$(setting model claude-haiku-4-5)}"
+
+# Which Pokémon the buddy is. Only Eevee evolves; the rest keep their form.
+SPECIES=$(setting species eevee)
+species_label() {
+  local l; l=$(jq -r --arg id "$1" '.[] | select(.id == $id) | .label' "$PLUGIN_DIR/forms/species.json" 2>/dev/null)
+  echo "${l:-${1^}}"
+}
+
+now() { date +%s; }
+
+# cooldown <key> <seconds>: succeeds (and arms) only if the key is not armed.
+cooldown() {
+  local f="$STATE/cd.$1" t
+  t=$(cat "$f" 2>/dev/null || echo 0)
+  (( $(now) - t < $2 )) && return 1
+  now >"$f"
+}
+
+find_claude() {
+  command -v claude && return
+  local c
+  for c in "$HOME/.local/share/mise/shims/claude" "$HOME/.local/bin/claude" \
+           "$HOME/.claude/local/claude" /usr/bin/claude; do
+    [[ -x $c ]] && { echo "$c"; return; }
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Context
+# ---------------------------------------------------------------------------
+top_cpu() { ps -eo comm,%cpu --sort=-%cpu --no-headers | awk -v me="$$" 'NR<=3 && $1!="ps"{printf "%s %s%%, ", $1, $2}' | sed 's/, $//'; }
+top_mem() { ps -eo comm,rss --sort=-rss --no-headers | awk 'NR<=3{printf "%s %.1fG, ", $1, $2/1048576}' | sed 's/, $//'; }
+mem_avail_pct() { awk '/MemTotal/{t=$2}/MemAvailable/{a=$2}END{printf "%d", a*100/t}' /proc/meminfo; }
+disk_pct() { df --output=pcent / | tail -1 | tr -dc '0-9'; }
+max_temp() {
+  local m=0 t z
+  for z in /sys/class/thermal/thermal_zone*/temp /sys/class/hwmon/hwmon*/temp*_input; do
+    [[ -r $z ]] || continue
+    t=$(( $(cat "$z" 2>/dev/null || echo 0) / 1000 ))
+    (( t > m && t < 125 )) && m=$t
+  done
+  echo "$m"
+}
+battery() {
+  local b
+  for b in /sys/class/power_supply/BAT*; do
+    [[ -r $b/capacity ]] && { echo "$(cat "$b/capacity") $(cat "$b/status")"; return; }
+  done
+}
+failed_units() {
+  { systemctl --failed --no-legend --plain 2>/dev/null; systemctl --user --failed --no-legend --plain 2>/dev/null; } \
+    | awk '{print $1}' | grep -v '^$' | sort -u | tr '\n' ' '
+}
+active_window() {
+  hyprctl activewindow -j 2>/dev/null | jq -r 'if .class then "\(.class) — \(.title)" else "desktop" end' 2>/dev/null
+}
+
+cmd_context() {
+  local bat; bat=$(battery)
+  cat <<EOF
+Time: $(date '+%A %Y-%m-%d %H:%M')
+Focused window: $(active_window)
+Open windows: $(hyprctl clients -j 2>/dev/null | jq -r '[.[].class] | unique | join(", ")' 2>/dev/null)
+Load (1m): $(cut -d' ' -f1 /proc/loadavg) on $(nproc) cores; top CPU: $(top_cpu)
+Memory available: $(mem_avail_pct)%; top memory: $(top_mem)
+Root disk used: $(disk_pct)%
+Hottest sensor: $(max_temp)°C
+Battery: ${bat:-none}
+Failed systemd units: $(failed_units)
+Uptime: $(uptime -p)
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Evolution. The brain owns the current form (persisted, survives restarts).
+# Each Eeveelution has a trigger rooted in something real; evolving is rare
+# ("sometimes"), and the form wears off after 20-40 minutes.
+# ---------------------------------------------------------------------------
+FORMS=(vaporeon jolteon flareon espeon umbreon leafeon glaceon sylveon)
+declare -A FORM_REASON=(
+  [flareon]="Your CPU is running hot, so the heat did it! 🔥"
+  [jolteon]="All that electricity went straight to my fur! ⚡"
+  [glaceon]="Nice and cool in here. Perfect for ice! ❄️"
+  [umbreon]="Night-time plus friendship: the moon did it! 🌙"
+  [espeon]="Daytime plus friendship: the sun did it! ☀️"
+  [leafeon]="Fresh morning air, just like a Moss Rock! 🍃"
+  [vaporeon]="You took a break. Refreshing, like water! 💧"
+  [sylveon]="All those pets! Pure affection! 🎀"
+)
+
+form_now() { local f; f=$(cut -f1 "$STATE/form" 2>/dev/null); echo "${f:-eevee}"; }
+
+set_form() { # set_form <form> <minutes-to-last>
+  printf '%s\t%s\n' "$1" "$(( $(now) + ${2:-0} * 60 ))" >"$STATE/form"
+  now >"$STATE/cd.evolve"
+}
+
+pretty() { echo "${1^}"; }
+
+evolve_message() { # evolve_message <from> <to> [reason]
+  if [[ $2 == eevee ]]; then
+    echo "$(pretty "$1") turned back into Eevee. Vee!"
+  else
+    echo "Eevee evolved into $(pretty "$2")! ${3:-${FORM_REASON[$2]}}"
+  fi
+}
+
+# Candidate forms for right now, strongest reasons first.
+evolution_candidates() {
+  local temp load cores pct status hour pets
+  temp=$(max_temp); load=$(cut -d' ' -f1 /proc/loadavg); cores=$(nproc)
+  read -r pct status <<<"$(battery)"
+  hour=$(date +%-H)
+  pets=$(awk -v t="$(( $(now) - 3600 ))" '$1 > t' "$STATE/pets" 2>/dev/null | wc -l)
+  (( pets >= 5 )) && echo sylveon
+  [[ -f $RUN/back_from_break ]] && echo vaporeon
+  (( temp >= 90 )) && echo flareon
+  awk -v l="$load" -v c="$cores" 'BEGIN{exit !(l > c*0.6)}' && echo jolteon
+  [[ ${status:-} == Charging ]] && echo jolteon
+  (( temp > 0 && temp < 55 )) && echo glaceon
+  (( hour >= 20 || hour < 5 )) && echo umbreon
+  (( hour >= 9 && hour < 17 )) && echo espeon
+  (( hour >= 5 && hour < 9 )) && echo leafeon
+  return 0
+}
+
+# Prints "form<TAB>name<TAB>message" (message only on change).
+evolution_tick() {
+  local cur until t cands pick
+  cur=$(form_now); t=$(now)
+  until=$(cut -f2 "$STATE/form" 2>/dev/null); until=${until:-0}
+
+  if [[ $cur != eevee ]]; then
+    if (( t >= until )); then
+      set_form eevee 0
+      printf 'form\teevee\t%s\n' "$(evolve_message "$cur" eevee)"
+    else
+      printf 'form\t%s\t\n' "$cur"
+    fi
+    return
+  fi
+
+  if [[ $SPECIES != eevee ]] || ! enabled evolution true; then
+    rm -f "$RUN/back_from_break"
+    printf 'form\teevee\t\n'
+    return
+  fi
+
+  mapfile -t cands < <(evolution_candidates)
+  # Sylveon/Vaporeon are earned, so they fire promptly; the rest are a
+  # ~1-in-40 roll per 20 s tick (about every 15 min) after a 25 min rest;
+  # a close friend rolls more often (down to 1-in-20).
+  if (( ${#cands[@]} )) && [[ ${cands[0]} == sylveon || ${cands[0]} == vaporeon ]] && cooldown evolve-earned 1200; then
+    pick=${cands[0]}
+  elif (( ${#cands[@]} )) && (( RANDOM % (40 - 2 * $(friend_level)) == 0 )) && cooldown evolve 1500; then
+    pick=${cands[RANDOM % ${#cands[@]}]}
+  fi
+  rm -f "$RUN/back_from_break"
+
+  if [[ -n ${pick:-} ]]; then
+    set_form "$pick" $(( 20 + RANDOM % 21 ))
+    [[ $pick == sylveon ]] && : >"$STATE/pets"
+    printf 'form\t%s\t%s\n' "$pick" "$(evolve_message eevee "$pick")"
+  else
+    printf 'form\teevee\t\n'
+  fi
+}
+
+cmd_evolve() {
+  local want="${1:-}" cur cands
+  cur=$(form_now)
+  if [[ -z $want ]]; then
+    mapfile -t cands < <(evolution_candidates)
+    (( ${#cands[@]} )) || cands=("${FORMS[@]}")
+    want=${cands[RANDOM % ${#cands[@]}]}
+  fi
+  want=${want,,}
+  if [[ $want != eevee && " ${FORMS[*]} " != *" $want "* ]]; then
+    echo "Eevee can't evolve into '$want'. Try: ${FORMS[*]}" >&2; return 1
+  fi
+  set_form "$want" $(( 20 + RANDOM % 21 ))
+  [[ $want == eevee ]] && evolve_message "$cur" eevee || evolve_message "$cur" "$want" "Evolution on demand!"
+}
+
+cmd_pet() { now >>"$STATE/pets"; befriend 1; }
+
+# Shiny: one roll a day, 1 in 4096 like the games (or always / never, per
+# the settings). Kept for the whole day once rolled.
+shiny_today() {
+  case $(setting shiny rare) in
+    always) echo 1; return ;;
+    never) echo 0; return ;;
+  esac
+  local today roll
+  today=$(date +%F)
+  { read -r day roll <"$STATE/shiny"; } 2>/dev/null
+  if [[ ${day:-} != "$today" ]]; then
+    roll=$(( RANDOM % 4096 == 0 ? 1 : 0 ))
+    echo "$today $roll" >"$STATE/shiny"
+  fi
+  echo "${roll:-0}"
+}
+
+# Friendship: pets and chats add points; the level (0-10) makes her livelier
+# and evolve more often.
+befriend() { echo $(( $(friend_points) + $1 )) >"$STATE/friendship"; }
+friend_points() { cat "$STATE/friendship" 2>/dev/null || echo 0; }
+friend_level() { local l; l=$(awk -v p="$(friend_points)" 'BEGIN{printf "%d", sqrt(p/5)}'); echo $(( l > 10 ? 10 : l )); }
+
+# ---------------------------------------------------------------------------
+# Sensing: turn raw state into a few well-timed remarks, never spam.
+# ---------------------------------------------------------------------------
+say() { printf '%s\t%s\n' "$1" "$2"; }
+
+# Reminders are real notifications, so they reach you through Eevee (or
+# Omarchy's popups when she isn't delivering them) and land in the history.
+remind() { notify-send -a Eevee -u low "$1" "$2" >/dev/null 2>&1 & }
+
+track_activity() {
+  # "Active" = cursor or focused window changed since last tick. Five quiet
+  # minutes count as a break and reset the streak.
+  local sig last_sig t streak_start last_active
+  sig="$(hyprctl cursorpos 2>/dev/null)|$(hyprctl activewindow -j 2>/dev/null | jq -r '.address // ""' 2>/dev/null)"
+  last_sig=$(cat "$RUN/sig" 2>/dev/null)
+  echo "$sig" >"$RUN/sig"
+  t=$(now)
+  last_active=$(cat "$RUN/last_active" 2>/dev/null || echo "$t")
+  streak_start=$(cat "$RUN/streak_start" 2>/dev/null || echo "$t")
+  if [[ $sig != "$last_sig" ]]; then
+    if (( t - last_active > 300 )); then
+      streak_start=$t
+      (( t - last_active > 600 )) && touch "$RUN/back_from_break"
+    fi
+    last_active=$t
+  fi
+  echo "$last_active" >"$RUN/last_active"
+  echo "$streak_start" >"$RUN/streak_start"
+  IDLE_SECS=$(( t - last_active ))
+  STREAK_MIN=$(( (t - streak_start) / 60 ))
+}
+
+cmd_sense() {
+  track_activity
+  # Type events (see the top): back from a break, the morning's first
+  # activity, and a cool machine (at most every 2 h).
+  [[ -f $RUN/back_from_break ]] && say refresh ""
+  local h; h=$(date +%-H)
+  (( h >= 5 && h < 11 )) && (( IDLE_SECS < 60 )) && cooldown morning 43200 && say morning ""
+  local tc; tc=$(max_temp)
+  (( tc > 0 && tc < 50 )) && (( IDLE_SECS < 60 )) && cooldown cool 7200 && say cool ""
+  evolution_tick
+  printf 'friend\t%s\n' "$(friend_level)"
+  printf 'shiny\t%s\n' "$(shiny_today)"
+  # What's on screen, for the lock screen design: "<sprite set>\t<shiny 0|1>".
+  local sprite; sprite=$([[ $SPECIES == eevee ]] && form_now || echo "$SPECIES")
+  printf '%s\t%s\n' "$sprite" "$(shiny_today)" >"$STATE/sprite.tmp" && mv "$STATE/sprite.tmp" "$STATE/sprite"
+  local load cores mem disk temp bat pct status failed hour known new_failed
+
+  # Idle long enough -> nap. Printed as a state line, not a remark.
+  (( IDLE_SECS > 240 )) && say sleepy ""
+
+  load=$(cut -d' ' -f1 /proc/loadavg); cores=$(nproc)
+  if awk -v l="$load" -v c="$cores" 'BEGIN{exit !(l > c*0.85)}' && cooldown cpu 900; then
+    say hot "Your CPU is maxed (load $load on $cores cores). Biggest eaters: $(top_cpu)."
+  fi
+
+  mem=$(mem_avail_pct)
+  if (( mem < 10 )) && cooldown mem 900; then
+    say alert "Only ${mem}% RAM left! $(top_mem | cut -d, -f1) is hogging it."
+  fi
+
+  disk=$(disk_pct)
+  if (( disk >= 90 )) && cooldown disk 21600; then
+    say alert "Your disk is ${disk}% full. Try 'paccache -rk1' or clearing ~/.cache."
+  fi
+
+  temp=$(max_temp)
+  if (( temp >= 95 )) && cooldown temp 1800; then
+    say hot "It's getting hot in here: ${temp}°C. $(top_cpu | cut -d, -f1) is the likely culprit."
+  fi
+
+  read -r pct status <<<"$(battery)"
+  if [[ -n ${pct:-} ]]; then
+    if [[ $status == Discharging ]]; then
+      rm -f "$STATE/cd.batfull"
+      if (( pct <= 10 )) && cooldown batcrit 600; then
+        say alert "Battery at ${pct}%! Plug in now or save your work."
+      elif (( pct <= 20 )) && cooldown batlow 1800; then
+        say alert "Battery's at ${pct}%. A charger soon would be nice."
+      fi
+    else
+      rm -f "$STATE/cd.batlow" "$STATE/cd.batcrit"
+      [[ $status == Full ]] && cooldown batfull 86400 >/dev/null && say happy "Fully charged! You can unplug me."
+    fi
+  fi
+
+  failed=$(failed_units)
+  known=$(cat "$STATE/failed_known" 2>/dev/null)
+  new_failed=""
+  for u in $failed; do [[ " $known " == *" $u "* ]] || new_failed+="$u "; done
+  echo "$failed" >"$STATE/failed_known"
+  [[ -n $new_failed ]] && say spooky "A service just failed: ${new_failed% }."
+
+  local brk; brk=$(setting breakMinutes 50)
+  if (( brk > 0 && STREAK_MIN >= brk )) && (( IDLE_SECS < 60 )) && cooldown break $(( brk * 60 )); then
+    say calm ""
+    remind "Time for a break" "You've been at it for ${STREAK_MIN} minutes. Stretch, drink some water, and look at something 6 m away for 20 s."
+  fi
+
+  hour=$(date +%-H)
+  if enabled lateNight true && (( hour >= 1 && hour < 5 )) && (( IDLE_SECS < 60 )) && cooldown latenight 14400; then
+    remind "It's $(date +%H:%M)" "Even $(species_label "$SPECIES") is asleep by now. Save your work and get some rest?"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Launching apps. Matches installed .desktop entries (bin/eevee-apps.py),
+# focuses the app if it already has a window, otherwise starts it through
+# uwsm like the Omarchy launcher does. Exit 3 = nothing matched.
+# ---------------------------------------------------------------------------
+SELF="$(readlink -f "$0")"
+APPS="$(dirname "$SELF")/eevee-apps.py"
+
+focus_existing() { # focus_existing <pattern>... -> 0 if a window was focused
+  local p addr
+  for p in "$@"; do
+    [[ -n $p ]] || continue
+    addr=$(hyprctl clients -j 2>/dev/null | jq -r --arg p "${p,,}" \
+      '[.[] | select((.class | ascii_downcase) == $p or (.initialClass | ascii_downcase) == $p)][0].address // empty')
+    if [[ -n $addr ]]; then
+      hyprctl dispatch "hl.dsp.focus({ window = \"address:$addr\" })" >/dev/null 2>&1 \
+        || hyprctl dispatch focuswindow "address:$addr" >/dev/null 2>&1
+      return 0
+    fi
+  done
+  return 1
+}
+
+detach() { setsid -f "$@" >/dev/null 2>&1 </dev/null; }
+
+cmd_launch() {
+  local q="$*" url best id name wm stem others
+  q="${q#"${q%%[![:space:]]*}"}"; q="${q%"${q##*[![:space:]]}"}"
+  [[ -n $q ]] || { echo "Launch what? Tell me an app name."; return 3; }
+
+  if [[ $q =~ ^https?:// || $q =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(/[^[:space:]]*)?$ ]]; then
+    url=$q; [[ $url == http* ]] || url="https://$url"
+    detach omarchy-launch-browser "$url"
+    echo "Opening $url in your browser!"
+    return 0
+  fi
+
+  case "${q,,}" in
+    terminal|term|shell|console|a\ terminal)
+      detach omarchy-launch-terminal; echo "Here's a terminal!"; return 0 ;;
+    browser|web|internet|web\ browser|the\ browser|navegador)
+      detach omarchy-launch-browser; echo "Opening your browser!"; return 0 ;;
+    files|file\ manager|explorer|ficheiros|arquivos)
+      focus_existing org.gnome.nautilus || detach omarchy-launch-nautilus; echo "Opening Files!"; return 0 ;;
+  esac
+
+  best=$(python3 "$APPS" find "$q" | head -1)
+  if [[ -z $best ]] || (( $(jq -r .score <<<"$best") < 50 )); then
+    others=$(python3 "$APPS" find "$q" | jq -r .name | head -3 | paste -sd, | sed 's/,/, /g')
+    echo "I couldn't find an app called '$q'.${others:+ Did you mean: $others?}"
+    return 3
+  fi
+  id=$(jq -r .id <<<"$best"); name=$(jq -r .name <<<"$best"); wm=$(jq -r .wmclass <<<"$best")
+  stem=${id%.desktop}
+
+  if focus_existing "$wm" "$stem" "${stem##*.}" "$(jq -r '.exec | split(" ")[0] | split("/")[-1]' <<<"$best")"; then
+    echo "$name is already open, so I brought it to the front!"
+    return 0
+  fi
+  detach uwsm-app -- "$id"
+  echo "Opening $name! Vee!"
+}
+
+cmd_apps() { python3 "$APPS" list "$@"; }
+
+# Fast path for "open X": try locally, fall back to Claude for vague requests.
+cmd_open() {
+  local out
+  out=$(cmd_launch "$*"); local rc=$?
+  if (( rc == 3 )) && (( $(wc -w <<<"$*") > 1 )); then
+    cmd_ask "Please open/launch this for me: $*
+(No app name matched it directly. Installed apps, as id<TAB>name<TAB>kind:
+$(cmd_apps)
+Pick the best fit and launch it with the launch command. If nothing fits, say so and suggest one to install.)"
+    return
+  fi
+  # A direct hit needs no words (the app appearing is the answer); only
+  # "couldn't find" messages are worth showing.
+  (( rc == 0 )) || echo "$out"
+}
+
+# ---------------------------------------------------------------------------
+# Screen state, polled every few seconds by the sprite: a fullscreen window
+# covers Eevee (Omarchy's own popups take over), and while the screen is
+# shared or recorded she hides so notifications don't leak into it.
+# ---------------------------------------------------------------------------
+cmd_screen() { # "<fullscreen 0|1> <recording 0|1>"; portal shares are watched in QML
+  local fs rec=0
+  fs=$(hyprctl activewindow -j 2>/dev/null | jq -r '(.fullscreen // 0) >= 2 | if . then 1 else 0 end' 2>/dev/null)
+  pgrep -x 'gpu-screen-reco|wf-recorder|obs' >/dev/null && rec=1
+  echo "${fs:-0} $rec"
+}
+
+# ---------------------------------------------------------------------------
+# Lock screen: installs lock/ShelfEevee.qml as a design for the Lock Designs
+# plugin (io.github.smoothpixels.lock-designs) and selects it; "off" puts
+# back the design that was active before.
+# ---------------------------------------------------------------------------
+LOCK_DIR="$HOME/.config/omarchy/lock-designs"
+LOCK_ID="my-shelfeevee"
+
+lock_designs_ready() { [[ -d $LOCK_DIR ]] && [[ -n $(omarchy-shell lock design 2>/dev/null) ]]; }
+
+cmd_lockscreen() {
+  local cur prev
+  case "${1:-status}" in
+    status)
+      if ! lock_designs_ready; then echo missing
+      elif [[ $(omarchy-shell lock design 2>/dev/null) == "$LOCK_ID" ]]; then echo on
+      else echo off
+      fi ;;
+    on)
+      lock_designs_ready || { echo missing; return 1; }
+      sed "s|@BUDDY_DIR@|$PLUGIN_DIR|g" "$PLUGIN_DIR/lock/ShelfEevee.qml" >"$LOCK_DIR/ShelfEevee.qml"
+      cur=$(omarchy-shell lock design 2>/dev/null)
+      [[ -n $cur && $cur != "$LOCK_ID" ]] && echo "$cur" >"$STATE/lock-previous"
+      omarchy-shell lock rescanDesigns >/dev/null 2>&1
+      local i
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        omarchy-shell lock designs 2>/dev/null | grep -q "\"$LOCK_ID\"" && break
+        sleep 0.3
+      done
+      omarchy-shell lock setDesign "$LOCK_ID" >/dev/null 2>&1
+      cmd_lockscreen status ;;
+    off)
+      lock_designs_ready || { echo missing; return 0; }
+      prev=$(cat "$STATE/lock-previous" 2>/dev/null)
+      [[ $(omarchy-shell lock design 2>/dev/null) == "$LOCK_ID" ]] && omarchy-shell lock setDesign "${prev:-classic}" >/dev/null 2>&1
+      rm -f "$LOCK_DIR/ShelfEevee.qml"
+      omarchy-shell lock rescanDesigns >/dev/null 2>&1
+      cmd_lockscreen status ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Hover card: a quick snapshot, only computed while you hover over her.
+# ---------------------------------------------------------------------------
+cmd_hover() {
+  local pct status temp next
+  read -r pct status <<<"$(battery)"
+  temp=$(max_temp)
+  next=$(omarchy reminder show --json 2>/dev/null | jq -c '[.reminders[]?] | sort_by(.remainingSeconds) | .[0] // empty' 2>/dev/null)
+  jq -cn \
+    --argjson cpu "$(awk -v l="$(cut -d' ' -f1 /proc/loadavg)" -v c="$(nproc)" 'BEGIN{v=l*100/c; if(v>100)v=100; printf "%d", v}')" \
+    --argjson mem "$(( 100 - $(mem_avail_pct) ))" \
+    --argjson disk "$(disk_pct)" \
+    --argjson temp "${temp:-0}" \
+    --arg battery "${pct:-}" --arg charging "${status:-}" \
+    --argjson reminder "${next:-null}" \
+    '{cpu: $cpu, mem: $mem, disk: $disk, temp: $temp, battery: $battery, charging: $charging,
+      reminder: (if $reminder then "\($reminder.message) in \($reminder.remaining)" else "" end)}'
+}
+
+# ---------------------------------------------------------------------------
+# Long commands: shell/eevee-hook.bash calls cmd-done when a command ran for
+# 10 s or more. If it passed the threshold and you're looking elsewhere, a
+# notification says how it went; clicking it jumps back to that terminal.
+# ---------------------------------------------------------------------------
+fmt_duration() {
+  local s=$1
+  (( s >= 3600 )) && { printf '%dh %dm' $((s / 3600)) $((s % 3600 / 60)); return; }
+  (( s >= 60 )) && { printf '%dm %ds' $((s / 60)) $((s % 60)); return; }
+  printf '%ds' "$s"
+}
+
+cmd_done() {
+  local secs=$1 status=$2 spid=$3; shift 3
+  local cmd="$*" min
+  min=$(setting longCommandSeconds 30)
+  (( min > 0 && secs >= min )) || return 0
+  # Interactive programs aren't "jobs" you wait for.
+  case "${cmd%% *}" in
+    vim|nvim|vi|nano|hx|micro|less|more|man|ssh|mosh|htop|btop|top|tmux|zellij|lazygit|lazydocker|claude|fg|watch|yazi|ranger|nnn|bash|sh|zsh|fish|python|python3|node|psql|mysql|sqlite3|tail) return 0 ;;
+  esac
+
+  # The window running this shell: walk up from the shell to a client pid.
+  local -A clients=()
+  local addr pid class
+  while IFS=$'\t' read -r pid addr class; do clients[$pid]="$addr"$'\t'"$class"; done \
+    < <(hyprctl clients -j 2>/dev/null | jq -r '.[] | "\(.pid)\t\(.address)\t\(.class)"')
+  local p=$spid win=""
+  while [[ -n $p ]] && (( p > 1 )); do
+    [[ -n ${clients[$p]-} ]] && { win=${clients[$p]}; break; }
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+  done
+  addr=${win%%$'\t'*}; class=${win#*$'\t'}
+  # Still looking at it? Then you saw it finish.
+  [[ -n $addr && $(hyprctl activewindow -j 2>/dev/null | jq -r '.address // ""') == "$addr" ]] && return 0
+
+  local short=$cmd
+  (( ${#short} > 60 )) && short="${short:0:57}…"
+  local title urgency=normal
+  if (( status == 0 )); then title="✓ Done: $short"
+  else title="✗ Failed (exit $status): $short"; urgency=critical
+  fi
+  local args=(-a Terminal -u "$urgency")
+  [[ -n $class ]] && args+=(-h "string:desktop-entry:$class")
+  if [[ -n $addr ]]; then
+    args+=(-h "string:omarchy-exec-argv:$(jq -cn --arg a "$addr" \
+      '["bash","-c","hyprctl dispatch \"hl.dsp.focus({ window = \\\"address:\($a)\\\" })\" >/dev/null 2>&1 || hyprctl dispatch focuswindow address:\($a)"]')")
+  fi
+  notify-send "${args[@]}" "$title" "Took $(fmt_duration "$secs")"
+}
+
+HOOK_LINE="[[ -f \"$PLUGIN_DIR/shell/eevee-hook.bash\" ]] && source \"$PLUGIN_DIR/shell/eevee-hook.bash\" # eevee-buddy"
+
+cmd_cmdhook() {
+  local rc="$HOME/.bashrc"
+  case "${1:-status}" in
+    status) grep -q '# eevee-buddy$' "$rc" 2>/dev/null && echo on || echo off ;;
+    on)
+      grep -q '# eevee-buddy$' "$rc" 2>/dev/null || printf '\n%s\n' "$HOOK_LINE" >>"$rc"
+      echo on ;;
+    off)
+      [[ -f $rc ]] && sed -i '/# eevee-buddy$/d' "$rc"
+      echo off ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Memory: short facts kept across chats (plain lines in $STATE/memory).
+# ---------------------------------------------------------------------------
+cmd_remember() {
+  local fact="$*"
+  fact=$(tr '\n' ' ' <<<"$fact" | sed 's/[[:space:]]*$//')
+  [[ -n $fact ]] || return 0
+  grep -qxF -- "$fact" "$STATE/memory" 2>/dev/null || echo "$fact" >>"$STATE/memory"
+  # Keep the newest 60 facts.
+  tail -n 60 "$STATE/memory" >"$STATE/memory.tmp" && mv "$STATE/memory.tmp" "$STATE/memory"
+  echo "Remembered."
+}
+
+cmd_forget() {
+  if [[ -z ${1:-} ]]; then rm -f "$STATE/memory"
+  else grep -viF -- "$*" "$STATE/memory" >"$STATE/memory.tmp" 2>/dev/null; mv "$STATE/memory.tmp" "$STATE/memory"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Talking: Claude Haiku, sandboxed to read-only tools, with live context.
+# ---------------------------------------------------------------------------
+NAME=$(species_label "$SPECIES")
+SYSTEM_PROMPT="You are $NAME, a small, friendly Pokémon who lives at the bottom of the user's screen on an Omarchy Linux desktop (Arch Linux + Hyprland, Quickshell-based shell; Omarchy commands are under \`omarchy <group> <action>\`, sources in /usr/share/omarchy, user config in ~/.config). You are a genuinely useful assistant: answer questions, explain errors, diagnose the system, look things up.
+Rules:
+- Your reply is shown in a small speech bubble. Be brief: usually 1-4 short sentences, at most ~90 words. Plain text only: no markdown headings, tables, bold or \`\`\` code fences. Short inline \`code\` is fine; put a command the user should run on its own line.
+- Be accurate. Use your tools (read files, read-only commands, web search) to check facts about this machine instead of guessing.
+- This is Arch Linux: prefer pacman/AUR packages (e.g. python-requests) or a venv/uv over a global pip install, and omarchy commands where one exists.
+- You CAN open apps and URLs for the user. To list installed apps run exactly: $SELF apps [filter]
+  To open (or focus) one run exactly: $SELF launch \"<app name, .desktop id, or URL>\"
+  Do this whenever the user asks to open, launch, start, play or show something that an app or website handles, then confirm in a few words.
+- You can set reminders: run exactly: omarchy reminder <minutes> \"<message>\" (it arrives as a notification).
+- You have a memory across chats (listed in the prompt). When the user tells you a lasting fact or preference worth keeping, save it by running exactly: $SELF remember \"<fact>\"
+- If the prompt mentions a screenshot, Read that image file to see the user's screen before answering.
+- Apart from launching apps, reminders and memory, you cannot change the system. If something needs changing, tell the user the exact command to run.
+- A light touch of personality (an occasional cry of your own name, like 'Vee!' or 'Pika!') is welcome; never at the expense of usefulness."
+
+ALLOWED_TOOLS=(
+  Read Glob Grep WebSearch WebFetch
+  "Bash(ps:*)" "Bash(df:*)" "Bash(du:*)" "Bash(free:*)" "Bash(uptime:*)" "Bash(ls:*)" "Bash(cat:*)"
+  "Bash(journalctl:*)" "Bash(systemctl status:*)" "Bash(systemctl --user status:*)"
+  "Bash(systemctl --failed:*)" "Bash(systemctl list-units:*)" "Bash(pacman -Q:*)" "Bash(pacman -Si:*)"
+  "Bash(hyprctl clients:*)" "Bash(hyprctl activewindow:*)" "Bash(hyprctl monitors:*)" "Bash(hyprctl version:*)"
+  "Bash(sensors:*)" "Bash(ip addr:*)" "Bash(ip route:*)" "Bash(nmcli:*)" "Bash(lsblk:*)" "Bash(lscpu:*)"
+  "Bash(uname:*)" "Bash(which:*)" "Bash(omarchy commands:*)" "Bash(omarchy version:*)"
+  "Bash(omarchy reminder:*)" "Bash(date:*)" "Bash(cal:*)"
+  "Bash($SELF launch:*)" "Bash($SELF apps:*)" "Bash($SELF remember:*)"
+)
+
+cmd_ask() {
+  local form; form=$(pretty "$(form_now)")
+  local persona="You are currently in your $form form."
+  [[ $form == Eevee ]] || persona="You are currently $form: you evolved from Eevee and will turn back later. Let a little of $form's flavour show."
+  [[ $SPECIES == eevee ]] || persona="Let a little of $NAME's personality show."
+  local question="$1" claude sid_file="$STATE/session" sid="" out answer
+  enabled ai true || return 0
+  claude=$(find_claude) || { echo "I can't find the claude CLI, so I can only watch your system for now."; return 0; }
+
+  if [[ -f $sid_file ]] && (( $(now) - $(stat -c %Y "$sid_file") < SESSION_TTL )); then
+    sid=$(cat "$sid_file")
+  fi
+
+  local prompt memory="" shot=""
+  [[ -s $STATE/memory ]] && memory="
+Things you remember about the user:
+$(sed 's/^/- /' "$STATE/memory")
+"
+  # Only when asked about the screen: capture the focused monitor for Claude.
+  if enabled screenshots true && grep -qiE "(my|the|this|on) screen|screenshot|what am i (looking at|seeing)|what'?s this" <<<"$question"; then
+    local mon; mon=$(hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused) | .name')
+    grim ${mon:+-o "$mon"} "$RUN/screen.png" 2>/dev/null && shot="
+A screenshot of the user's screen right now: $RUN/screen.png
+"
+  fi
+  befriend 1
+
+  prompt="Live desktop context (for reference, don't recite it):
+$(cmd_context)
+$memory$shot
+User: $question"
+
+  cd "$STATE" || return 1
+  out=$(timeout 120 "$claude" -p \
+    --model "$CLAUDE_MODEL" \
+    --setting-sources project --strict-mcp-config \
+    --permission-mode default \
+    --tools "Read,Glob,Grep,Bash,WebSearch,WebFetch" \
+    --allowedTools "${ALLOWED_TOOLS[@]}" \
+    --append-system-prompt "$SYSTEM_PROMPT
+- $persona" \
+    --max-turns 10 \
+    --output-format json \
+    ${sid:+--resume "$sid"} \
+    -- "$prompt" 2>"$RUN/ask.err")
+
+  rm -f "$RUN/screen.png"
+  answer=$(jq -r '.result // empty' <<<"$out" 2>/dev/null)
+  jq -c '{t: now | todate, denied: [.permission_denials[]?.tool_input.command // empty]}' <<<"$out" >>"$RUN/ask.log" 2>/dev/null
+  if [[ -z $answer ]] && [[ -n $sid ]]; then
+    # The old session may have expired server-side; retry once from scratch.
+    rm -f "$sid_file"
+    cmd_ask "$question"; return
+  fi
+  jq -r '.session_id // empty' <<<"$out" 2>/dev/null >"$sid_file.tmp" && [[ -s $sid_file.tmp ]] && mv "$sid_file.tmp" "$sid_file"
+  if [[ -z $answer ]]; then
+    echo "Vee... I couldn't reach my brain just now. ($(head -c 160 "$RUN/ask.err" | tr '\n' ' '))"
+  else
+    # Bubble is plain text: drop code fences and markdown emphasis, squeeze blank lines.
+    printf '%s\n' "$answer" | sed -E '/^[[:space:]]*```/d; s/\*\*([^*]+)\*\*/\1/g; s/^#+ //' | cat -s
+  fi
+}
+
+case "${1:-}" in
+  sense) cmd_sense ;;
+  context) cmd_context ;;
+  ask) shift; cmd_ask "$*" ;;
+  evolve) shift; cmd_evolve "${1:-}" ;;
+  devolve) cmd_evolve eevee ;;
+  pet) cmd_pet ;;
+  screen) cmd_screen ;;
+  remember) shift; cmd_remember "$*" ;;
+  forget) shift; cmd_forget "$*" ;;
+  lockscreen) shift; cmd_lockscreen "${1:-status}" ;;
+  hover) cmd_hover ;;
+  cmd-done) shift; cmd_done "$@" ;;
+  cmdhook) shift; cmd_cmdhook "${1:-status}" ;;
+  form) form_now ;;
+  launch) shift; cmd_launch "$*" ;;
+  apps) shift; cmd_apps "$@" ;;
+  open) shift; cmd_open "$*" ;;
+  reset) rm -f "$STATE/session"; echo "Okay, fresh start!" ;;
+  *) sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

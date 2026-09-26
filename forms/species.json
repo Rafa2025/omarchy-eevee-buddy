@@ -1,0 +1,47 @@
+[
+ {
+  "id": "eevee",
+  "label": "Eevee",
+  "evolves": true
+ },
+ {
+  "id": "pikachu",
+  "label": "Pikachu",
+  "evolves": false
+ },
+ {
+  "id": "charmander",
+  "label": "Charmander",
+  "evolves": false
+ },
+ {
+  "id": "bulbasaur",
+  "label": "Bulbasaur",
+  "evolves": false
+ },
+ {
+  "id": "squirtle",
+  "label": "Squirtle",
+  "evolves": false
+ },
+ {
+  "id": "psyduck",
+  "label": "Psyduck",
+  "evolves": false
+ },
+ {
+  "id": "munchlax",
+  "label": "Munchlax",
+  "evolves": false
+ },
+ {
+  "id": "snorlax",
+  "label": "Snorlax",
+  "evolves": false
+ },
+ {
+  "id": "gengar",
+  "label": "Gengar",
+  "evolves": false
+ }
+]
