@@ -5,8 +5,7 @@
 A pixel Pokémon that lives along the bottom of your screen on [Omarchy](https://omarchy.org). Eevee by default, or Pikachu, Charmander, Bulbasaur, Squirtle, Psyduck, Munchlax, Snorlax or Gengar. She wanders around, naps when you're away, and:
 
 - **Delivers your notifications** in her speech bubble instead of Omarchy's popups: 5 seconds each, a burst from one app folds into one bubble, and clicking one opens the app that sent it. While you're away, they wait and come back as one "while you were away" summary.
-- **Levels up** from real work: finished focus sessions, long commands, breaks, questions and pets. At the right level she evolves for good: Charmander into Charmeleon at 16 and Charizard at 36, Bulbasaur at 16 and 32, Squirtle at 16 and 36, Pikachu into Raichu at 30, Psyduck at 33, Munchlax into Snorlax at 25. Give her an Everstone to keep her as she is.
-- **Changes with her mood** (Eevee) into the Eeveelution that fits the moment: Flareon when the CPU runs hot, Jolteon while charging, Umbreon at night, Espeon by day, Leafeon in the morning, Glaceon when it's cool, Vaporeon after a break, Sylveon after lots of pets. It wears off after 20 to 40 minutes.
+- **Evolves** (Eevee only) into the Eeveelution that fits the moment: Flareon when the CPU runs hot, Jolteon while charging, Umbreon at night, Espeon by day, Leafeon in the morning, Glaceon when it's cool, Vaporeon after a break, Sylveon after lots of pets. It wears off after 20 to 40 minutes.
 - **Attacks** when an event matches her type: plug in the charger and Pikachu uses Thunderbolt. Fire types react to a hot CPU, Water to you coming back from a break, Grass to the morning, Ice to a cool machine, Ghost and Dark to a failed service, Fairy to pets, Psychic to answering you. Everyone attacks when a long command finishes.
 - **Tells you when long commands finish**, if you've switched to another window: "✓ Done: mvn test · Took 2m 14s", or ✗ with the exit code. Clicking it jumps back to that terminal.
 - **Answers questions** through the [Claude Code](https://claude.com/claude-code) CLI. It can look at your system with read-only tools, open apps, set reminders, remember things you tell it, look at your screen when you ask, and explain files you drop on her.
@@ -63,7 +62,7 @@ omarchy-shell rafa.eevee focusMode 50
 
 ## Settings
 
-Type `/settings` in her chat box, or run `omarchy-shell rafa.eevee settings`. The settings window shows her level and XP, and covers which Pokémon, Everstone, reduce motion, shiny, screen, size, wandering, music, evolution, attacks, notifications, the Claude model, memory, break reminders, long commands and the lock screen.
+Type `/settings` in her chat box, or run `omarchy-shell rafa.eevee settings`. The settings window covers which Pokémon, reduce motion, shiny, screen, size, wandering, music, evolution, attacks, notifications, the Claude model, memory, break reminders, long commands and the lock screen.
 
 Settings are saved Omarchy's way, inline on the plugin's entry in `~/.config/omarchy/shell.json`.
 

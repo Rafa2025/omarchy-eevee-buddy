@@ -12,7 +12,6 @@
 #   eevee-brain evolve [form]    evolve now (random fitting form if omitted)
 #   eevee-brain devolve          turn back into Eevee
 #   eevee-brain pet              record a pet (affection -> Sylveon)
-#   eevee-brain xp [amount]      gain XP (or show the level line)
 #   eevee-brain remember <fact>  keep a fact across chats (forget [text] drops)
 #   eevee-brain lockscreen [on|off|status]   Eevee napping on the lock screen
 #                                (needs the Lock Designs plugin)
@@ -92,7 +91,7 @@ find_claude() {
 }
 
 species_label() {
-  local l; l=$(jq -r --arg id "$1" '.[$id] // empty' "$PLUGIN_DIR/forms/labels.json" 2>/dev/null)
+  local l; l=$(jq -r --arg id "$1" '.[] | select(.id == $id) | .label' "$PLUGIN_DIR/forms/species.json" 2>/dev/null)
   echo "${l:-${1^}}"
 }
 
@@ -301,14 +300,6 @@ cmd_evolve() {
 cmd_pet() {
   printf '%s\n' "$EPOCHSECONDS" >>"$STATE/pets"
   befriend 1
-  # Pets are worth a little XP, up to 20 a day.
-  local day n; printf -v day '%(%F)T' -1
-  { read -r d n <"$STATE/pet-xp"; } 2>/dev/null
-  [[ ${d:-} == "$day" ]] || n=0
-  if (( ${n:-0} < 10 )); then
-    printf '%s %s\n' "$day" $(( ${n:-0} + 1 )) >"$STATE/pet-xp"
-    xp_gain 2
-  fi
 }
 
 # Shiny (SHINY=0|1): one roll a day, 1 in 4096 like the games (or always /
@@ -338,88 +329,6 @@ friend_level() {
 }
 
 # ---------------------------------------------------------------------------
-# Levels. Every Pokémon earns XP from real things: finished focus sessions,
-# long commands, breaks, pets, questions, the morning's start. Level =
-# 2 x cube root of XP (level 5 to start, 100 max). At the right level she
-# evolves for good: Charmander at 16 and 36, Bulbasaur at 16 and 32,
-# Squirtle at 16 and 36, Psyduck at 33, Pikachu at 30, Munchlax at 25.
-# Eevee has no level evolutions: her moods do that. The Everstone setting
-# stops evolution. XP is kept per chosen Pokémon in $STATE/xp.
-# ---------------------------------------------------------------------------
-declare -A EVOLVES_TO=(
-  [charmander]="charmeleon 16" [charmeleon]="charizard 36"
-  [bulbasaur]="ivysaur 16" [ivysaur]="venusaur 32"
-  [squirtle]="wartortle 16" [wartortle]="blastoise 36"
-  [pikachu]="raichu 30" [psyduck]="golduck 33" [munchlax]="snorlax 25"
-)
-
-xp_load() {
-  declare -gA XP=()
-  local s v
-  if [[ -f $STATE/xp ]]; then
-    while read -r s v; do [[ -n $s ]] && XP[$s]=$v; done <"$STATE/xp"
-  fi
-}
-xp_save() {
-  local s out=""
-  for s in "${!XP[@]}"; do out+="$s ${XP[$s]}"$'\n'; done
-  printf '%s' "$out" >"$STATE/xp"
-}
-level_of() { # level_of <xp> -> LEVEL = floor(cbrt(8 xp)) = floor(2 cbrt(xp)), 5..100
-  local l=5
-  while (( l < 100 && (l + 1) * (l + 1) * (l + 1) <= 8 * $1 )); do (( l++ )); done
-  LEVEL=$l
-}
-xp_for() { # xp_for <level> -> NEED (xp at which that level starts)
-  local l=$1; NEED=$(( (l * l * l + 7) / 8 ))
-}
-stage_of() { # stage_of <species> <level> -> STAGE, NEXT, NEXT_AT
-  local s=$1 lv=$2 to at
-  NEXT="" NEXT_AT=0
-  while [[ -n ${EVOLVES_TO[$s]-} ]]; do
-    read -r to at <<<"${EVOLVES_TO[$s]}"
-    if enabled everstone false || (( lv < at )); then NEXT=$to; NEXT_AT=$at; break; fi
-    s=$to
-  done
-  STAGE=$s
-}
-
-# xp_gain <amount>: add XP to the current Pokémon. Prints a level line and,
-# on a level up or evolution, sends a notification (they're the only text
-# she shows on her own).
-xp_gain() {
-  xp_load
-  local cur=${XP[$SPECIES]:-16} old_level old_stage
-  level_of "$cur"; old_level=$LEVEL
-  stage_of "$SPECIES" "$old_level"; old_stage=$STAGE
-  XP[$SPECIES]=$(( cur + $1 ))
-  xp_save
-  level_line
-  if [[ $STAGE != "$old_stage" ]]; then
-    notify-send -a "$(species_label "$old_stage")" "What? $(species_label "$old_stage") is evolving!" \
-      "Congratulations! It evolved into $(species_label "$STAGE") at Lv. $LEVEL." >/dev/null 2>&1 &
-  elif (( LEVEL > old_level )); then
-    notify-send -a "$(species_label "$STAGE")" -u low "$(species_label "$STAGE") grew to Lv. $LEVEL!" \
-      "${NEXT:+Evolves into $(species_label "$NEXT") at Lv. $NEXT_AT.}" >/dev/null 2>&1 &
-  fi
-}
-
-# "level<TAB>level<TAB>xp into level<TAB>xp for next<TAB>stage<TAB>next<TAB>next at"
-level_line() {
-  xp_load
-  local x=${XP[$SPECIES]:-16} base next
-  level_of "$x"
-  stage_of "$SPECIES" "$LEVEL"
-  xp_for "$LEVEL"; base=$NEED
-  xp_for $(( LEVEL + 1 )); next=$NEED
-  printf 'level\t%s\t%s\t%s\t%s\t%s\t%s\n' "$LEVEL" $(( x - base )) $(( next - base )) "$STAGE" "$NEXT" "$NEXT_AT"
-}
-
-cmd_xp() { # cmd_xp [amount]: gain XP (or just report)
-  if [[ -n ${1:-} ]]; then xp_gain "$1"; else level_line; fi
-}
-
-# ---------------------------------------------------------------------------
 # Sensing: turn raw state into a few well-timed remarks, never spam.
 # ---------------------------------------------------------------------------
 say() { printf '%s\t%s\n' "$1" "$2"; }
@@ -436,18 +345,17 @@ cmd_sense() {
 
   # Type events (see the top): back from a break, the morning's first
   # activity, and a cool machine (at most every 2 h).
-  if (( BACK )); then say refresh ""; xp_gain 15 >/dev/null; fi
-  if (( hour >= 5 && hour < 11 && ACTIVE )) && cooldown morning 43200; then say morning ""; xp_gain 10 >/dev/null; fi
+  (( BACK )) && say refresh ""
+  (( hour >= 5 && hour < 11 && ACTIVE )) && cooldown morning 43200 && say morning ""
   read_temp
   (( TEMP > 0 && TEMP < 50 && ACTIVE )) && cooldown cool 7200 && say cool ""
 
   evolution_tick
   friend_level; printf 'friend\t%s\n' "$FRIEND"
   shiny_today; printf 'shiny\t%s\n' "$SHINY"
-  level_line
   # What's on screen, for the lock screen design: "<sprite set>\t<shiny 0|1>".
   local sprite old
-  if [[ $SPECIES == eevee ]]; then read_form; sprite=$FORM; else sprite=$STAGE; fi
+  if [[ $SPECIES == eevee ]]; then read_form; sprite=$FORM; else sprite=$SPECIES; fi
   readf old "$STATE/sprite"
   [[ $old == "$sprite"$'\t'"$SHINY" ]] || printf '%s\t%s\n' "$sprite" "$SHINY" >"$STATE/sprite"
 
@@ -676,7 +584,6 @@ cmd_done() {
   local short=$cmd
   (( ${#short} > 60 )) && short="${short:0:57}…"
   local title urgency=normal
-  xp_gain $(( status == 0 ? 10 : 5 )) >/dev/null
   if (( status == 0 )); then title="✓ Done: $short"
   else title="✗ Failed (exit $status): $short"; urgency=critical
   fi
@@ -728,7 +635,7 @@ cmd_forget() {
 # ---------------------------------------------------------------------------
 NAME=Eevee
 if [[ ${1:-} == ask || ${1:-} == open ]]; then # only chat needs the (jq) label
-  xp_load; level_of "${XP[$SPECIES]:-16}"; stage_of "$SPECIES" "$LEVEL"; NAME=$(species_label "$STAGE")
+  NAME=$(species_label "$SPECIES")
 fi
 SYSTEM_PROMPT="You are $NAME, a small, friendly Pokémon who lives at the bottom of the user's screen on an Omarchy Linux desktop (Arch Linux + Hyprland, Quickshell-based shell; Omarchy commands are under \`omarchy <group> <action>\`, sources in /usr/share/omarchy, user config in ~/.config). You are a genuinely useful assistant: answer questions, explain errors, diagnose the system, look things up.
 Rules:
@@ -814,7 +721,6 @@ User: $question"
   if [[ -z $answer ]]; then
     echo "Vee... I couldn't reach my brain just now. ($(head -c 160 "$RUN/ask.err" | tr '\n' ' '))"
   else
-    xp_gain 3 >/dev/null
     # Bubble is plain text: drop code fences and markdown emphasis, squeeze blank lines.
     printf '%s\n' "$answer" | sed -E '/^[[:space:]]*```/d; s/\*\*([^*]+)\*\*/\1/g; s/^#+ //' | cat -s
   fi
@@ -832,7 +738,6 @@ case "${1:-}" in
   lockscreen) shift; cmd_lockscreen "${1:-status}" ;;
   hover) cmd_hover ;;
   cmd-done) shift; cmd_done "$@" ;;
-  xp) shift; cmd_xp "${1:-}" ;;
   cmdhook) shift; cmd_cmdhook "${1:-status}" ;;
   form) form_now ;;
   launch) shift; cmd_launch "$*" ;;

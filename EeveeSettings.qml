@@ -86,13 +86,6 @@ Scope {
     onLoadFailed: ui.memoryCount = 0
   }
 
-  // Display names for every sprite set, including evolution stages.
-  property var labels: ({})
-  FileView {
-    path: ui.buddy.pluginDir + "/forms/labels.json"
-    onLoaded: { try { ui.labels = JSON.parse(text()) } catch (e) { ui.labels = ({}) } }
-  }
-
   readonly property var formNames: ["eevee", "vaporeon", "jolteon", "flareon", "espeon", "umbreon", "leafeon", "glaceon", "sylveon"]
   readonly property var modelOptions: [
     { value: "claude-haiku-4-5", label: "Haiku 4.5 · fastest" },
@@ -232,30 +225,10 @@ Scope {
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(4)
               Text {
-                text: (ui.buddy.evolves ? ui.buddy.pretty(ui.buddy.form) : (ui.labels[ui.buddy.shownForm] || ui.buddy.speciesLabel))
-                  + "  ·  Lv. " + ui.buddy.level + (ui.buddy.shiny ? "  ✦" : "")
+                text: (ui.buddy.evolves ? ui.buddy.pretty(ui.buddy.form) : ui.buddy.speciesLabel) + (ui.buddy.shiny ? "  ✦" : "")
                 color: ui.fg
                 font.family: ui.fontFamily
                 font.pixelSize: Style.font.iconLarge
-              }
-              // XP towards the next level.
-              Rectangle {
-                width: 220; height: 6; radius: 3
-                color: Qt.rgba(ui.fg.r, ui.fg.g, ui.fg.b, 0.15)
-                Rectangle {
-                  width: parent.width * Math.min(1, ui.buddy.levelXp / Math.max(1, ui.buddy.levelNeed))
-                  height: parent.height; radius: 3
-                  color: ui.accent
-                }
-              }
-              Text {
-                text: ui.buddy.nextStage !== ""
-                  ? (ui.s.everstone ? "Holding an Everstone · won't evolve into " : "Evolves into ")
-                    + (ui.labels[ui.buddy.nextStage] || ui.buddy.pretty(ui.buddy.nextStage)) + " at Lv. " + ui.buddy.nextAt
-                  : (ui.buddy.evolves ? "Evolves with her moods, not levels" : "Fully evolved")
-                color: ui.dim
-                font.family: ui.fontFamily
-                font.pixelSize: Style.font.caption
               }
               Text {
                 text: "Friendship " + ui.buddy.friendship + "/10 · pets and chats make her livelier"
@@ -326,12 +299,6 @@ Scope {
           SettingToggle { key: "music"; label: "Bop to music"; description: "Nod along while a media player is playing." }
           SettingToggle { key: "musicControls"; label: "Music controls on hover"; description: "Hover over her to see the track with previous, play/pause and next (Spotify or any media player)." }
           SettingToggle { key: "hoverStatus"; label: "Status on hover"; description: "When nothing is playing, hovering shows CPU, memory, heat, battery and your next reminder." }
-          SettingToggle {
-            visible: !ui.buddy.evolves
-            key: "everstone"
-            label: "Everstone"
-            description: "She levels up from focus sessions, finished commands, breaks, pets and questions, and evolves at the right level (Charmander at 16 and 36, Pikachu at 30, …). Give her an Everstone to stay as she is."
-          }
           SettingToggle { visible: ui.buddy.evolves; key: "evolution"; label: "Evolve on her own"; description: "Now and then turn into an Eeveelution that fits the moment: heat, charging, time of day, breaks, pets." }
 
           SettingRow {

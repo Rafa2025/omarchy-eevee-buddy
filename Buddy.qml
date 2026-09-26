@@ -50,8 +50,7 @@ Item {
   // ---------------------------------------------------------------------
   readonly property var defaults: ({
     species: "eevee", shiny: "rare", screen: "follow", size: 3, wander: true,
-    music: true, musicControls: true, hoverStatus: true, evolution: true, longCommandSeconds: 30, attacks: true,
-    everstone: false, reduceMotion: false,
+    music: true, musicControls: true, hoverStatus: true, evolution: true, longCommandSeconds: 30, attacks: true, reduceMotion: false,
     notifications: true, noteSeconds: 5, holdWhileAway: true, hideWhenSharing: true,
     ai: true, model: "claude-haiku-4-5", screenshots: true,
     reactions: true, breakMinutes: 50, lateNight: true
@@ -168,55 +167,8 @@ Item {
       if (root.speciesList[i].id === root.species) return root.speciesList[i].label
     return root.pretty(root.species)
   }
-  // Levels (from the brain): other species evolve for good as they level up;
-  // stage is the evolution they've reached (Charmander -> Charmeleon ...).
-  property int level: 5
-  property int levelXp: 0
-  property int levelNeed: 1
-  property string stage: ""
-  property string nextStage: ""
-  property int nextAt: 0
-  property bool stageSynced: false
-  readonly property string buddyForm: root.evolves ? root.form : (root.forms[root.stage] ? root.stage : root.species)
-  onSpeciesChanged: {
-    root.stageSynced = false
-    root.stage = ""
-    if (!root.evolving) root.shownForm = root.buddyForm
-    root.gainXp(0) // fetch the new Pokémon's level right away
-  }
-
-  function handleLevel(msg) {
-    var f = String(msg).split("\t")
-    root.level = parseInt(f[0]) || 5
-    root.levelXp = parseInt(f[1]) || 0
-    root.levelNeed = Math.max(1, parseInt(f[2]) || 1)
-    var st = f[3] || root.species
-    root.nextStage = f[4] || ""
-    root.nextAt = parseInt(f[5]) || 0
-    if (root.evolves) { root.stage = st; return }
-    if (!root.stageSynced || !root.forms[st]) {
-      root.stageSynced = true
-      root.stage = st
-      if (!root.evolving) root.shownForm = root.buddyForm
-    } else if (st !== root.stage) {
-      var from = root.shownForm
-      root.stage = st
-      if (root.evolving || root.chatOpen || root.thinking) root.shownForm = st
-      else root.playEvolution(from, st)
-    }
-  }
-
-  // XP from things that happen here (a finished focus session); gainXp(0)
-  // just refreshes the level line.
-  function gainXp(n) {
-    if (xpProc.running) return
-    xpProc.command = ["bash", root.brain, "xp"].concat(n > 0 ? [String(Math.round(n))] : [])
-    xpProc.running = true
-  }
-  Process {
-    id: xpProc
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.handleBrainLines(String(text || "")) }
-  }
+  readonly property string buddyForm: root.evolves ? root.form : root.species
+  onSpeciesChanged: if (!root.evolving) root.shownForm = root.buddyForm
   property bool shinyToday: false
   readonly property bool shiny: root.settings.shiny === "always" || (root.settings.shiny !== "never" && root.shinyToday)
 
@@ -505,9 +457,7 @@ Item {
     eevee: ["normal"], vaporeon: ["water"], jolteon: ["electric"], flareon: ["fire"],
     espeon: ["psychic"], umbreon: ["dark"], leafeon: ["grass"], glaceon: ["ice"], sylveon: ["fairy"],
     pikachu: ["electric"], charmander: ["fire"], bulbasaur: ["grass"], squirtle: ["water"],
-    psyduck: ["water", "psychic"], munchlax: ["normal"], snorlax: ["normal"], gengar: ["ghost"],
-    charmeleon: ["fire"], charizard: ["fire"], ivysaur: ["grass"], venusaur: ["grass"],
-    wartortle: ["water"], blastoise: ["water"], raichu: ["electric"], golduck: ["water", "psychic"]
+    psyduck: ["water", "psychic"], munchlax: ["normal"], snorlax: ["normal"], gengar: ["ghost"]
   })
   readonly property var types: root.typesOf[root.shownForm] || ["normal"]
   // Which event calls for which type. "any" means every Pokémon joins in.
@@ -644,7 +594,7 @@ Item {
     root.playEvolution(from, target)
   }
 
-  // The evolution sequence, for Eevee's moods and level evolutions alike.
+  // The evolution sequence (white silhouette, flicker, flash).
   function playEvolution(from, to) {
     if (root.settings.reduceMotion) { root.shownForm = to; return }
     root.evolveFrom = from
@@ -910,7 +860,6 @@ Item {
 
   function startFocus(minutes) {
     minutes = Math.max(1, Math.min(480, Math.round(Number(minutes) || 25)))
-    root.focusMinutes = minutes
     root.focusUntil = Date.now() + minutes * 60000
     focusEnd.interval = minutes * 60000
     focusEnd.restart()
@@ -927,9 +876,7 @@ Item {
     root.releaseHeld("During focus")
   }
 
-  // A focus session that runs its course is worth 2 XP a minute.
-  property int focusMinutes: 0
-  Timer { id: focusEnd; onTriggered: { root.gainXp(root.focusMinutes * 2); root.endFocus() } }
+  Timer { id: focusEnd; onTriggered: root.endFocus() }
 
   Process {
     id: notifyWatch
@@ -1087,7 +1034,7 @@ Item {
     senseProc.running = true
   }
 
-  // Lines from the brain: "mood<TAB>message", plus form/friend/shiny/level.
+  // Lines from the brain: "mood<TAB>message", plus form/friend/shiny.
   function handleBrainLines(text) {
         var lines = String(text || "").split("\n")
         for (var i = 0; i < lines.length; i++) {
@@ -1095,7 +1042,6 @@ Item {
           var tab = lines[i].indexOf("\t")
           var mood = tab < 0 ? lines[i] : lines[i].slice(0, tab)
           var msg = tab < 0 ? "" : lines[i].slice(tab + 1)
-          if (mood === "level") { root.handleLevel(msg); continue }
           if (mood === "friend") { root.friendship = parseInt(msg) || 0; continue }
           if (mood === "form") {
             var tab2 = msg.indexOf("\t")
@@ -1170,7 +1116,7 @@ Item {
         asking: askProc.running, form: root.form, shown: root.shownForm, evolving: root.evolving,
         forms: Object.keys(root.forms).length, screen: root.screenName, fullscreen: root.fullscreen,
         sharing: root.sharing, recording: root.recording, portalSharing: root.portalSharing,
-        species: root.species, stage: root.stage, level: root.level, xp: root.levelXp + "/" + root.levelNeed,
+        species: root.species,
         shiny: root.shiny,
         actionsOpen: root.actionsOpen, hoverCard: root.controlsVisible, focusing: root.focusing, held: root.heldNotes.length, music: root.musicPlaying,
         friendship: root.friendship, note: root.speechNote ? root.speechNote.app : null,

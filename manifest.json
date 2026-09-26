@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "rafa.desktop-buddy",
   "name": "Eevee",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "author": "Rafa2025",
-  "description": "A pixel Pokémon companion for Omarchy: Eevee (or Pikachu, Charmander, Gengar…) walks along the bottom of your screen, levels up and evolves with your work, delivers your notifications, attacks when things happen, naps on your lock screen, tells you when long commands finish, and answers questions through Claude.",
+  "description": "A pixel Pokémon companion for Omarchy: Eevee (or Pikachu, Charmander, Gengar…) walks along the bottom of your screen, delivers your notifications, evolves and attacks when things happen, naps on your lock screen, tells you when long commands finish, and answers questions through Claude.",
   "kinds": [
     "panel"
   ],
