@@ -324,9 +324,13 @@ Item {
     { icon: "󰒓", label: "Settings", fn: "settings" },
     { icon: "󰌾", label: "Lock screen", run: ["omarchy-system-lock"] }
   ]
+  // The ring and the chat box replace each other: only one is ever open.
   function toggleActions() {
     root.actionsOpen = !root.actionsOpen
-    if (root.actionsOpen) { root.dismissSpeech(); root.walking = false; root.play("LookUp"); actionsIdle.restart() }
+    if (root.actionsOpen) {
+      if (root.chatOpen) root.closeChat()
+      root.dismissSpeech(); root.walking = false; root.play("LookUp"); actionsIdle.restart()
+    }
   }
   function runAction(a) {
     root.actionsOpen = false
@@ -926,6 +930,7 @@ Item {
   // Brain processes
   // ---------------------------------------------------------------------
   function openChat() {
+    root.actionsOpen = false
     root.dismissSpeech()
     root.chatOpen = true
     root.walking = false
@@ -1189,7 +1194,7 @@ Item {
         onReleased: if (dragged) behaviourTimer.restartIn(3000)
         onClicked: function(e) {
           if (dragged || e.button === Qt.RightButton) return
-          if (root.actionsOpen) { root.actionsOpen = false; return }
+          root.actionsOpen = false
           if (e.button === Qt.MiddleButton) root.pet()
           else if (e.button === Qt.RightButton) root.toggleActions()
           else if (root.chatOpen) root.closeChat()
