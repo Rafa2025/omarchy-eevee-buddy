@@ -1101,7 +1101,8 @@ Item {
   IpcHandler {
     target: "rafa.eevee"
     function talk(): void { if (root.chatOpen) root.closeChat(); else root.openChat() }
-    function close(): void { root.closeChat(); root.dismissSpeech() }
+    function close(): void { root.closeChat(); root.dismissSpeech(); root.actionsOpen = false; settingsWindow.shown = false }
+    function pet(): void { root.pet() }
     function ask(question: string): void { root.ask(question) }
     function say(text: string): void { root.say(text, "happy") }
     function evolve(form: string): void { root.requestEvolve(form) }
@@ -1133,7 +1134,8 @@ Item {
         asking: askProc.running, form: root.form, shown: root.shownForm, evolving: root.evolving,
         forms: Object.keys(root.forms).length, screen: root.screenName, fullscreen: root.fullscreen,
         sharing: root.sharing, recording: root.recording, portalSharing: root.portalSharing,
-        species: root.species,
+        species: root.species, attacking: root.attacking, pinned: root.pinned, hoverCard: root.controlsVisible,
+        settingsOpen: settingsWindow.shown,
         shiny: root.shiny,
         actionsOpen: root.actionsOpen, hoverCard: root.controlsVisible, focusing: root.focusing, held: root.heldNotes.length, music: root.musicPlaying,
         friendship: root.friendship, note: root.speechNote ? root.speechNote.app : null,
