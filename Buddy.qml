@@ -317,7 +317,9 @@ Item {
     { icon: "󰹑", label: "Screenshot", run: ["omarchy-capture-screenshot"] },
     { icon: "󰊄", label: "Copy text from screen", run: ["omarchy-capture-text"] },
     { icon: "󰈊", label: "Pick a colour", run: ["hyprpicker", "-a"] },
-    { icon: "󰅌", label: "Clipboard", run: ["omarchy-menu-clipboard"] },
+    // The same clipboard the bar opens: the iamcheyan.clipboard plugin when
+    // installed (opens at the cursor, i.e. next to her), else Omarchy's own.
+    { icon: "󰅌", label: "Clipboard", run: ["bash", "-c", "omarchy-shell iamcheyan.clipboard open >/dev/null 2>&1 || omarchy-menu-clipboard"] },
     { icon: "󰞅", label: "Emoji", run: ["omarchy-menu-emoji"] },
     { icon: "󰔟", label: root.focusing ? "End focus" : "Focus for 25 min", fn: "focus" },
     { icon: "󱐋", label: "Attack!", fn: "attack" },
