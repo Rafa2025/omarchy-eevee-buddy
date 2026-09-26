@@ -2,7 +2,7 @@
 # Eevee's brain. The QML side only animates and renders; everything that
 # needs judgement lives here so it can be tested from a terminal:
 #
-#   eevee-brain sense            one sensing tick -> "mood<TAB>message" lines
+#   eevee-brain sense [active streak back]  one sensing tick -> "mood<TAB>message" lines
 #   eevee-brain context          plain-text snapshot of the desktop
 #   eevee-brain ask <question>   answer via Claude (keeps a short-lived session)
 #   eevee-brain launch <app|url> open (or focus, if already open) an app or URL
@@ -12,7 +12,7 @@
 #   eevee-brain evolve [form]    evolve now (random fitting form if omitted)
 #   eevee-brain devolve          turn back into Eevee
 #   eevee-brain pet              record a pet (affection -> Sylveon)
-#   eevee-brain screen           "<fullscreen 0|1> <recording 0|1>" for the sprite
+#   eevee-brain xp [amount]      gain XP (or show the level line)
 #   eevee-brain remember <fact>  keep a fact across chats (forget [text] drops)
 #   eevee-brain lockscreen [on|off|status]   Eevee napping on the lock screen
 #                                (needs the Lock Designs plugin)
@@ -35,41 +35,50 @@
 set -u
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/eevee"
 RUN="${XDG_RUNTIME_DIR:-/tmp}/eevee"
-mkdir -p "$STATE" "$RUN"
-chmod 700 "$RUN"
+[[ -d $STATE ]] || mkdir -p "$STATE"
+[[ -d $RUN ]] || { mkdir -p "$RUN"; chmod 700 "$RUN"; }
 
 SESSION_TTL=1800 # a chat older than 30 min starts fresh
 
-# Settings: the plugin's entry in shell.json, read once per run.
-PLUGIN_DIR="$(dirname "$(dirname "$(readlink -f "$0")")")"
-PLUGIN_ID=$(jq -r '.id // empty' "$PLUGIN_DIR/manifest.json" 2>/dev/null)
-PLUGIN_ID=${PLUGIN_ID:-rafa.desktop-buddy}
+# The sense tick runs every 20 s, so everything it touches is written with
+# bash builtins only (read, printf -v, $EPOCHSECONDS, globs): no subshells,
+# no external programs. Slow facts (failed units, disk) are cached.
+
+case $0 in
+  */bin/eevee-brain) PLUGIN_DIR=${0%/bin/eevee-brain} ;;
+  *) PLUGIN_DIR="$(dirname "$(dirname "$(readlink -f "$0")")")" ;;
+esac
+SELF="$PLUGIN_DIR/bin/eevee-brain"
+
+# Settings: the plugin's entry in shell.json. Parsed with jq only when
+# shell.json (or the manifest) changed; otherwise sourced from a cache.
 declare -A CFG=()
-while IFS=$'\t' read -r k v; do
-  [[ -n $k ]] && CFG[$k]=$v
-done < <(jq -r --arg id "$PLUGIN_ID" \
-  '.plugins[]? | select(.id == $id) | to_entries[] | select(.key != "id") | "\(.key)\t\(.value)"' \
-  "$HOME/.config/omarchy/shell.json" 2>/dev/null)
+PLUGIN_ID=rafa.desktop-buddy
+SHELL_JSON="$HOME/.config/omarchy/shell.json"
+CFG_CACHE="$RUN/settings.sh"
+if [[ ! -f $CFG_CACHE || $SHELL_JSON -nt $CFG_CACHE || $PLUGIN_DIR/manifest.json -nt $CFG_CACHE ]]; then
+  jq -r --slurpfile m "$PLUGIN_DIR/manifest.json" \
+    '($m[0].id // "rafa.desktop-buddy") as $id | "PLUGIN_ID=\($id | @sh)",
+     (.plugins[]? | select(.id == $id) | to_entries[] | select(.key != "id")
+      | "CFG[\(.key | @sh)]=\(.value | tostring | @sh)")' \
+    "$SHELL_JSON" >"$CFG_CACHE.tmp" 2>/dev/null || : >"$CFG_CACHE.tmp"
+  mv -f "$CFG_CACHE.tmp" "$CFG_CACHE"
+fi
+source "$CFG_CACHE"
 setting() { local v="${CFG[$1]-}"; echo "${v:-$2}"; }  # setting <key> <default>
-enabled() { [[ $(setting "$1" "$2") == true ]]; }     # enabled <key> <true|false>
+enabled() { local v="${CFG[$1]-}"; [[ ${v:-$2} == true ]]; } # enabled <key> <true|false>
 
-CLAUDE_MODEL="${EEVEE_MODEL:-$(setting model claude-haiku-4-5)}"
+CLAUDE_MODEL="${EEVEE_MODEL:-${CFG[model]:-claude-haiku-4-5}}"
+SPECIES=${CFG[species]:-eevee}
 
-# Which Pokémon the buddy is. Only Eevee evolves; the rest keep their form.
-SPECIES=$(setting species eevee)
-species_label() {
-  local l; l=$(jq -r --arg id "$1" '.[] | select(.id == $id) | .label' "$PLUGIN_DIR/forms/species.json" 2>/dev/null)
-  echo "${l:-${1^}}"
-}
-
-now() { date +%s; }
+# readf <var> <file>: first line of a file, or empty.
+readf() { local __l=""; { IFS= read -r __l <"$2"; } 2>/dev/null; printf -v "$1" '%s' "$__l"; }
 
 # cooldown <key> <seconds>: succeeds (and arms) only if the key is not armed.
 cooldown() {
-  local f="$STATE/cd.$1" t
-  t=$(cat "$f" 2>/dev/null || echo 0)
-  (( $(now) - t < $2 )) && return 1
-  now >"$f"
+  local t; readf t "$STATE/cd.$1"
+  (( EPOCHSECONDS - ${t:-0} < $2 )) && return 1
+  printf '%s\n' "$EPOCHSECONDS" >"$STATE/cd.$1"
 }
 
 find_claude() {
@@ -82,43 +91,91 @@ find_claude() {
   return 1
 }
 
+species_label() {
+  local l; l=$(jq -r --arg id "$1" '.[$id] // empty' "$PLUGIN_DIR/forms/labels.json" 2>/dev/null)
+  echo "${l:-${1^}}"
+}
+
 # ---------------------------------------------------------------------------
-# Context
+# System facts. The read_* functions set globals (no subshell); the echoing
+# wrappers are for the rare paths (chat context, hover card).
 # ---------------------------------------------------------------------------
-top_cpu() { ps -eo comm,%cpu --sort=-%cpu --no-headers | awk -v me="$$" 'NR<=3 && $1!="ps"{printf "%s %s%%, ", $1, $2}' | sed 's/, $//'; }
-top_mem() { ps -eo comm,rss --sort=-rss --no-headers | awk 'NR<=3{printf "%s %.1fG, ", $1, $2/1048576}' | sed 's/, $//'; }
-mem_avail_pct() { awk '/MemTotal/{t=$2}/MemAvailable/{a=$2}END{printf "%d", a*100/t}' /proc/meminfo; }
-disk_pct() { df --output=pcent / | tail -1 | tr -dc '0-9'; }
-max_temp() {
+read_load() { # LOAD (text), LOAD100 (load x 100), CORES
+  local l _
+  read -r l _ </proc/loadavg
+  LOAD=$l
+  local int=${l%.*} frac=${l#*.}00
+  LOAD100=$(( 10#$int * 100 + 10#${frac:0:2} ))
+  if [[ -z ${CORES-} ]]; then
+    readf CORES "$RUN/cores"
+    if [[ -z $CORES ]]; then
+      local line; CORES=0
+      while IFS= read -r line; do [[ $line == processor* ]] && (( CORES++ )); done </proc/cpuinfo
+      printf '%s\n' "$CORES" >"$RUN/cores"
+    fi
+  fi
+}
+read_mem() { # MEM_AVAIL (% available)
+  local k v total=0 avail=0
+  while read -r k v _; do
+    case $k in MemTotal:) total=$v ;; MemAvailable:) avail=$v; break ;; esac
+  done </proc/meminfo
+  MEM_AVAIL=$(( total ? avail * 100 / total : 100 ))
+}
+read_temp() { # TEMP (hottest sensor, °C)
   local m=0 t z
   for z in /sys/class/thermal/thermal_zone*/temp /sys/class/hwmon/hwmon*/temp*_input; do
     [[ -r $z ]] || continue
-    t=$(( $(cat "$z" 2>/dev/null || echo 0) / 1000 ))
+    t=0; { read -r t <"$z"; } 2>/dev/null
+    t=$(( ${t:-0} / 1000 ))
     (( t > m && t < 125 )) && m=$t
   done
-  echo "$m"
+  TEMP=$m
 }
-battery() {
+read_battery() { # BAT_PCT, BAT_STATUS (empty without a battery)
+  BAT_PCT="" BAT_STATUS=""
   local b
   for b in /sys/class/power_supply/BAT*; do
-    [[ -r $b/capacity ]] && { echo "$(cat "$b/capacity") $(cat "$b/status")"; return; }
+    [[ -r $b/capacity ]] || continue
+    readf BAT_PCT "$b/capacity"; readf BAT_STATUS "$b/status"
+    return
   done
 }
-failed_units() {
-  { systemctl --failed --no-legend --plain 2>/dev/null; systemctl --user --failed --no-legend --plain 2>/dev/null; } \
-    | awk '{print $1}' | grep -v '^$' | sort -u | tr '\n' ' '
+read_disk() { # DISK (% used), refreshed every 30 min
+  readf DISK "$RUN/disk"
+  if [[ -z $DISK ]] || cooldown disk-check 1800; then
+    DISK=$(df --output=pcent / 2>/dev/null | tail -1 | tr -dc '0-9')
+    printf '%s\n' "${DISK:-0}" >"$RUN/disk"
+  fi
+  DISK=${DISK:-0}
 }
+read_failed() { # FAILED (space-separated units), refreshed every 5 min
+  if [[ ! -f $RUN/failed ]] || cooldown failed-check 300; then
+    { systemctl --failed --no-legend --plain 2>/dev/null; systemctl --user --failed --no-legend --plain 2>/dev/null; } \
+      | awk '{print $1}' | grep -v '^$' | sort -u | tr '\n' ' ' >"$RUN/failed"
+  fi
+  readf FAILED "$RUN/failed"
+}
+
+top_cpu() { ps -eo comm,%cpu --sort=-%cpu --no-headers | awk 'NR<=3 && $1!="ps"{printf "%s %s%%, ", $1, $2}' | sed 's/, $//'; }
+top_mem() { ps -eo comm,rss --sort=-rss --no-headers | awk 'NR<=3{printf "%s %.1fG, ", $1, $2/1048576}' | sed 's/, $//'; }
+mem_avail_pct() { read_mem; echo "$MEM_AVAIL"; }
+disk_pct() { read_disk; echo "$DISK"; }
+max_temp() { read_temp; echo "$TEMP"; }
+battery() { read_battery; [[ -n $BAT_PCT ]] && echo "$BAT_PCT $BAT_STATUS"; }
+failed_units() { read_failed; echo "$FAILED"; }
 active_window() {
   hyprctl activewindow -j 2>/dev/null | jq -r 'if .class then "\(.class) — \(.title)" else "desktop" end' 2>/dev/null
 }
 
 cmd_context() {
   local bat; bat=$(battery)
+  read_load
   cat <<EOF
 Time: $(date '+%A %Y-%m-%d %H:%M')
 Focused window: $(active_window)
 Open windows: $(hyprctl clients -j 2>/dev/null | jq -r '[.[].class] | unique | join(", ")' 2>/dev/null)
-Load (1m): $(cut -d' ' -f1 /proc/loadavg) on $(nproc) cores; top CPU: $(top_cpu)
+Load (1m): $LOAD on $CORES cores; top CPU: $(top_cpu)
 Memory available: $(mem_avail_pct)%; top memory: $(top_mem)
 Root disk used: $(disk_pct)%
 Hottest sensor: $(max_temp)°C
@@ -129,9 +186,9 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Evolution. The brain owns the current form (persisted, survives restarts).
-# Each Eeveelution has a trigger rooted in something real; evolving is rare
-# ("sometimes"), and the form wears off after 20-40 minutes.
+# Eevee's moods. The brain owns her current form (persisted, survives
+# restarts). Each Eeveelution has a trigger rooted in something real;
+# evolving is rare ("sometimes"), and the form wears off after 20-40 min.
 # ---------------------------------------------------------------------------
 FORMS=(vaporeon jolteon flareon espeon umbreon leafeon glaceon sylveon)
 declare -A FORM_REASON=(
@@ -145,11 +202,16 @@ declare -A FORM_REASON=(
   [sylveon]="All those pets! Pure affection! 🎀"
 )
 
-form_now() { local f; f=$(cut -f1 "$STATE/form" 2>/dev/null); echo "${f:-eevee}"; }
+read_form() { # FORM, FORM_UNTIL
+  FORM="" FORM_UNTIL=0
+  { IFS=$'\t' read -r FORM FORM_UNTIL <"$STATE/form"; } 2>/dev/null
+  FORM=${FORM:-eevee}; FORM_UNTIL=${FORM_UNTIL:-0}
+}
+form_now() { read_form; echo "$FORM"; }
 
 set_form() { # set_form <form> <minutes-to-last>
-  printf '%s\t%s\n' "$1" "$(( $(now) + ${2:-0} * 60 ))" >"$STATE/form"
-  now >"$STATE/cd.evolve"
+  printf '%s\t%s\n' "$1" "$(( EPOCHSECONDS + ${2:-0} * 60 ))" >"$STATE/form"
+  printf '%s\n' "$EPOCHSECONDS" >"$STATE/cd.evolve"
 }
 
 pretty() { echo "${1^}"; }
@@ -162,59 +224,56 @@ evolve_message() { # evolve_message <from> <to> [reason]
   fi
 }
 
-# Candidate forms for right now, strongest reasons first.
+# CANDS: forms that fit right now, strongest reasons first.
 evolution_candidates() {
-  local temp load cores pct status hour pets
-  temp=$(max_temp); load=$(cut -d' ' -f1 /proc/loadavg); cores=$(nproc)
-  read -r pct status <<<"$(battery)"
-  hour=$(date +%-H)
-  pets=$(awk -v t="$(( $(now) - 3600 ))" '$1 > t' "$STATE/pets" 2>/dev/null | wc -l)
-  (( pets >= 5 )) && echo sylveon
-  [[ -f $RUN/back_from_break ]] && echo vaporeon
-  (( temp >= 90 )) && echo flareon
-  awk -v l="$load" -v c="$cores" 'BEGIN{exit !(l > c*0.6)}' && echo jolteon
-  [[ ${status:-} == Charging ]] && echo jolteon
-  (( temp > 0 && temp < 55 )) && echo glaceon
-  (( hour >= 20 || hour < 5 )) && echo umbreon
-  (( hour >= 9 && hour < 17 )) && echo espeon
-  (( hour >= 5 && hour < 9 )) && echo leafeon
+  CANDS=()
+  read_temp; read_load; read_battery
+  local hour pets=0 t
+  printf -v hour '%(%H)T' -1; hour=$((10#$hour))
+  if [[ -f $STATE/pets ]]; then
+    while read -r t; do (( t > EPOCHSECONDS - 3600 )) && (( pets++ )); done <"$STATE/pets"
+  fi
+  (( pets >= 5 )) && CANDS+=(sylveon)
+  (( BACK )) && CANDS+=(vaporeon)
+  (( TEMP >= 90 )) && CANDS+=(flareon)
+  (( LOAD100 > CORES * 60 )) && CANDS+=(jolteon)
+  [[ $BAT_STATUS == Charging ]] && CANDS+=(jolteon)
+  (( TEMP > 0 && TEMP < 55 )) && CANDS+=(glaceon)
+  (( hour >= 20 || hour < 5 )) && CANDS+=(umbreon)
+  (( hour >= 9 && hour < 17 )) && CANDS+=(espeon)
+  (( hour >= 5 && hour < 9 )) && CANDS+=(leafeon)
   return 0
 }
 
 # Prints "form<TAB>name<TAB>message" (message only on change).
 evolution_tick() {
-  local cur until t cands pick
-  cur=$(form_now); t=$(now)
-  until=$(cut -f2 "$STATE/form" 2>/dev/null); until=${until:-0}
-
-  if [[ $cur != eevee ]]; then
-    if (( t >= until )); then
+  local pick=""
+  read_form
+  if [[ $FORM != eevee ]]; then
+    if (( EPOCHSECONDS >= FORM_UNTIL )); then
       set_form eevee 0
-      printf 'form\teevee\t%s\n' "$(evolve_message "$cur" eevee)"
+      printf 'form\teevee\t%s\n' "$(evolve_message "$FORM" eevee)"
     else
-      printf 'form\t%s\t\n' "$cur"
+      printf 'form\t%s\t\n' "$FORM"
     fi
     return
   fi
-
   if [[ $SPECIES != eevee ]] || ! enabled evolution true; then
-    rm -f "$RUN/back_from_break"
     printf 'form\teevee\t\n'
     return
   fi
 
-  mapfile -t cands < <(evolution_candidates)
+  evolution_candidates
+  friend_level
   # Sylveon/Vaporeon are earned, so they fire promptly; the rest are a
   # ~1-in-40 roll per 20 s tick (about every 15 min) after a 25 min rest;
   # a close friend rolls more often (down to 1-in-20).
-  if (( ${#cands[@]} )) && [[ ${cands[0]} == sylveon || ${cands[0]} == vaporeon ]] && cooldown evolve-earned 1200; then
-    pick=${cands[0]}
-  elif (( ${#cands[@]} )) && (( RANDOM % (40 - 2 * $(friend_level)) == 0 )) && cooldown evolve 1500; then
-    pick=${cands[RANDOM % ${#cands[@]}]}
+  if (( ${#CANDS[@]} )) && [[ ${CANDS[0]} == sylveon || ${CANDS[0]} == vaporeon ]] && cooldown evolve-earned 1200; then
+    pick=${CANDS[0]}
+  elif (( ${#CANDS[@]} )) && (( RANDOM % (40 - 2 * FRIEND) == 0 )) && cooldown evolve 1500; then
+    pick=${CANDS[RANDOM % ${#CANDS[@]}]}
   fi
-  rm -f "$RUN/back_from_break"
-
-  if [[ -n ${pick:-} ]]; then
+  if [[ -n $pick ]]; then
     set_form "$pick" $(( 20 + RANDOM % 21 ))
     [[ $pick == sylveon ]] && : >"$STATE/pets"
     printf 'form\t%s\t%s\n' "$pick" "$(evolve_message eevee "$pick")"
@@ -224,12 +283,12 @@ evolution_tick() {
 }
 
 cmd_evolve() {
-  local want="${1:-}" cur cands
+  local want="${1:-}" cur
   cur=$(form_now)
   if [[ -z $want ]]; then
-    mapfile -t cands < <(evolution_candidates)
-    (( ${#cands[@]} )) || cands=("${FORMS[@]}")
-    want=${cands[RANDOM % ${#cands[@]}]}
+    BACK=0; evolution_candidates
+    (( ${#CANDS[@]} )) || CANDS=("${FORMS[@]}")
+    want=${CANDS[RANDOM % ${#CANDS[@]}]}
   fi
   want=${want,,}
   if [[ $want != eevee && " ${FORMS[*]} " != *" $want "* ]]; then
@@ -239,30 +298,126 @@ cmd_evolve() {
   [[ $want == eevee ]] && evolve_message "$cur" eevee || evolve_message "$cur" "$want" "Evolution on demand!"
 }
 
-cmd_pet() { now >>"$STATE/pets"; befriend 1; }
-
-# Shiny: one roll a day, 1 in 4096 like the games (or always / never, per
-# the settings). Kept for the whole day once rolled.
-shiny_today() {
-  case $(setting shiny rare) in
-    always) echo 1; return ;;
-    never) echo 0; return ;;
-  esac
-  local today roll
-  today=$(date +%F)
-  { read -r day roll <"$STATE/shiny"; } 2>/dev/null
-  if [[ ${day:-} != "$today" ]]; then
-    roll=$(( RANDOM % 4096 == 0 ? 1 : 0 ))
-    echo "$today $roll" >"$STATE/shiny"
+cmd_pet() {
+  printf '%s\n' "$EPOCHSECONDS" >>"$STATE/pets"
+  befriend 1
+  # Pets are worth a little XP, up to 20 a day.
+  local day n; printf -v day '%(%F)T' -1
+  { read -r d n <"$STATE/pet-xp"; } 2>/dev/null
+  [[ ${d:-} == "$day" ]] || n=0
+  if (( ${n:-0} < 10 )); then
+    printf '%s %s\n' "$day" $(( ${n:-0} + 1 )) >"$STATE/pet-xp"
+    xp_gain 2
   fi
-  echo "${roll:-0}"
 }
 
-# Friendship: pets and chats add points; the level (0-10) makes her livelier
-# and evolve more often.
-befriend() { echo $(( $(friend_points) + $1 )) >"$STATE/friendship"; }
-friend_points() { cat "$STATE/friendship" 2>/dev/null || echo 0; }
-friend_level() { local l; l=$(awk -v p="$(friend_points)" 'BEGIN{printf "%d", sqrt(p/5)}'); echo $(( l > 10 ? 10 : l )); }
+# Shiny (SHINY=0|1): one roll a day, 1 in 4096 like the games (or always /
+# never, per the settings). Kept for the whole day once rolled.
+shiny_today() {
+  case ${CFG[shiny]:-rare} in
+    always) SHINY=1; return ;;
+    never) SHINY=0; return ;;
+  esac
+  local today day="" roll=""
+  printf -v today '%(%F)T' -1
+  { read -r day roll <"$STATE/shiny"; } 2>/dev/null
+  if [[ $day != "$today" ]]; then
+    roll=$(( RANDOM % 4096 == 0 ? 1 : 0 ))
+    printf '%s %s\n' "$today" "$roll" >"$STATE/shiny"
+  fi
+  SHINY=${roll:-0}
+}
+
+# Friendship: pets and chats add points; the level (0-10, FRIEND) makes her
+# livelier and evolve more often.
+befriend() { local p; readf p "$STATE/friendship"; printf '%s\n' $(( ${p:-0} + $1 )) >"$STATE/friendship"; }
+friend_level() {
+  local p l=0; readf p "$STATE/friendship"; p=${p:-0}
+  while (( l < 10 && (l + 1) * (l + 1) * 5 <= p )); do (( l++ )); done
+  FRIEND=$l
+}
+
+# ---------------------------------------------------------------------------
+# Levels. Every Pokémon earns XP from real things: finished focus sessions,
+# long commands, breaks, pets, questions, the morning's start. Level =
+# 2 x cube root of XP (level 5 to start, 100 max). At the right level she
+# evolves for good: Charmander at 16 and 36, Bulbasaur at 16 and 32,
+# Squirtle at 16 and 36, Psyduck at 33, Pikachu at 30, Munchlax at 25.
+# Eevee has no level evolutions: her moods do that. The Everstone setting
+# stops evolution. XP is kept per chosen Pokémon in $STATE/xp.
+# ---------------------------------------------------------------------------
+declare -A EVOLVES_TO=(
+  [charmander]="charmeleon 16" [charmeleon]="charizard 36"
+  [bulbasaur]="ivysaur 16" [ivysaur]="venusaur 32"
+  [squirtle]="wartortle 16" [wartortle]="blastoise 36"
+  [pikachu]="raichu 30" [psyduck]="golduck 33" [munchlax]="snorlax 25"
+)
+
+xp_load() {
+  declare -gA XP=()
+  local s v
+  if [[ -f $STATE/xp ]]; then
+    while read -r s v; do [[ -n $s ]] && XP[$s]=$v; done <"$STATE/xp"
+  fi
+}
+xp_save() {
+  local s out=""
+  for s in "${!XP[@]}"; do out+="$s ${XP[$s]}"$'\n'; done
+  printf '%s' "$out" >"$STATE/xp"
+}
+level_of() { # level_of <xp> -> LEVEL = floor(cbrt(8 xp)) = floor(2 cbrt(xp)), 5..100
+  local l=5
+  while (( l < 100 && (l + 1) * (l + 1) * (l + 1) <= 8 * $1 )); do (( l++ )); done
+  LEVEL=$l
+}
+xp_for() { # xp_for <level> -> NEED (xp at which that level starts)
+  local l=$1; NEED=$(( (l * l * l + 7) / 8 ))
+}
+stage_of() { # stage_of <species> <level> -> STAGE, NEXT, NEXT_AT
+  local s=$1 lv=$2 to at
+  NEXT="" NEXT_AT=0
+  while [[ -n ${EVOLVES_TO[$s]-} ]]; do
+    read -r to at <<<"${EVOLVES_TO[$s]}"
+    if enabled everstone false || (( lv < at )); then NEXT=$to; NEXT_AT=$at; break; fi
+    s=$to
+  done
+  STAGE=$s
+}
+
+# xp_gain <amount>: add XP to the current Pokémon. Prints a level line and,
+# on a level up or evolution, sends a notification (they're the only text
+# she shows on her own).
+xp_gain() {
+  xp_load
+  local cur=${XP[$SPECIES]:-16} old_level old_stage
+  level_of "$cur"; old_level=$LEVEL
+  stage_of "$SPECIES" "$old_level"; old_stage=$STAGE
+  XP[$SPECIES]=$(( cur + $1 ))
+  xp_save
+  level_line
+  if [[ $STAGE != "$old_stage" ]]; then
+    notify-send -a "$(species_label "$old_stage")" "What? $(species_label "$old_stage") is evolving!" \
+      "Congratulations! It evolved into $(species_label "$STAGE") at Lv. $LEVEL." >/dev/null 2>&1 &
+  elif (( LEVEL > old_level )); then
+    notify-send -a "$(species_label "$STAGE")" -u low "$(species_label "$STAGE") grew to Lv. $LEVEL!" \
+      "${NEXT:+Evolves into $(species_label "$NEXT") at Lv. $NEXT_AT.}" >/dev/null 2>&1 &
+  fi
+}
+
+# "level<TAB>level<TAB>xp into level<TAB>xp for next<TAB>stage<TAB>next<TAB>next at"
+level_line() {
+  xp_load
+  local x=${XP[$SPECIES]:-16} base next
+  level_of "$x"
+  stage_of "$SPECIES" "$LEVEL"
+  xp_for "$LEVEL"; base=$NEED
+  xp_for $(( LEVEL + 1 )); next=$NEED
+  printf 'level\t%s\t%s\t%s\t%s\t%s\t%s\n' "$LEVEL" $(( x - base )) $(( next - base )) "$STAGE" "$NEXT" "$NEXT_AT"
+}
+
+cmd_xp() { # cmd_xp [amount]: gain XP (or just report)
+  if [[ -n ${1:-} ]]; then xp_gain "$1"; else level_line; fi
+}
 
 # ---------------------------------------------------------------------------
 # Sensing: turn raw state into a few well-timed remarks, never spam.
@@ -273,100 +428,71 @@ say() { printf '%s\t%s\n' "$1" "$2"; }
 # Omarchy's popups when she isn't delivering them) and land in the history.
 remind() { notify-send -a Eevee -u low "$1" "$2" >/dev/null 2>&1 & }
 
-track_activity() {
-  # "Active" = cursor or focused window changed since last tick. Five quiet
-  # minutes count as a break and reset the streak.
-  local sig last_sig t streak_start last_active
-  sig="$(hyprctl cursorpos 2>/dev/null)|$(hyprctl activewindow -j 2>/dev/null | jq -r '.address // ""' 2>/dev/null)"
-  last_sig=$(cat "$RUN/sig" 2>/dev/null)
-  echo "$sig" >"$RUN/sig"
-  t=$(now)
-  last_active=$(cat "$RUN/last_active" 2>/dev/null || echo "$t")
-  streak_start=$(cat "$RUN/streak_start" 2>/dev/null || echo "$t")
-  if [[ $sig != "$last_sig" ]]; then
-    if (( t - last_active > 300 )); then
-      streak_start=$t
-      (( t - last_active > 600 )) && touch "$RUN/back_from_break"
-    fi
-    last_active=$t
-  fi
-  echo "$last_active" >"$RUN/last_active"
-  echo "$streak_start" >"$RUN/streak_start"
-  IDLE_SECS=$(( t - last_active ))
-  STREAK_MIN=$(( (t - streak_start) / 60 ))
-}
-
+# sense <active 0|1> <work streak, minutes> <back from a break 0|1>
+# The sprite tracks activity with Wayland idle monitors and passes it in.
 cmd_sense() {
-  track_activity
+  ACTIVE=${1:-1} STREAK_MIN=${2:-0} BACK=${3:-0}
+  local hour; printf -v hour '%(%H)T' -1; hour=$((10#$hour))
+
   # Type events (see the top): back from a break, the morning's first
   # activity, and a cool machine (at most every 2 h).
-  [[ -f $RUN/back_from_break ]] && say refresh ""
-  local h; h=$(date +%-H)
-  (( h >= 5 && h < 11 )) && (( IDLE_SECS < 60 )) && cooldown morning 43200 && say morning ""
-  local tc; tc=$(max_temp)
-  (( tc > 0 && tc < 50 )) && (( IDLE_SECS < 60 )) && cooldown cool 7200 && say cool ""
+  if (( BACK )); then say refresh ""; xp_gain 15 >/dev/null; fi
+  if (( hour >= 5 && hour < 11 && ACTIVE )) && cooldown morning 43200; then say morning ""; xp_gain 10 >/dev/null; fi
+  read_temp
+  (( TEMP > 0 && TEMP < 50 && ACTIVE )) && cooldown cool 7200 && say cool ""
+
   evolution_tick
-  printf 'friend\t%s\n' "$(friend_level)"
-  printf 'shiny\t%s\n' "$(shiny_today)"
+  friend_level; printf 'friend\t%s\n' "$FRIEND"
+  shiny_today; printf 'shiny\t%s\n' "$SHINY"
+  level_line
   # What's on screen, for the lock screen design: "<sprite set>\t<shiny 0|1>".
-  local sprite; sprite=$([[ $SPECIES == eevee ]] && form_now || echo "$SPECIES")
-  printf '%s\t%s\n' "$sprite" "$(shiny_today)" >"$STATE/sprite.tmp" && mv "$STATE/sprite.tmp" "$STATE/sprite"
-  local load cores mem disk temp bat pct status failed hour known new_failed
+  local sprite old
+  if [[ $SPECIES == eevee ]]; then read_form; sprite=$FORM; else sprite=$STAGE; fi
+  readf old "$STATE/sprite"
+  [[ $old == "$sprite"$'\t'"$SHINY" ]] || printf '%s\t%s\n' "$sprite" "$SHINY" >"$STATE/sprite"
 
-  # Idle long enough -> nap. Printed as a state line, not a remark.
-  (( IDLE_SECS > 240 )) && say sleepy ""
-
-  load=$(cut -d' ' -f1 /proc/loadavg); cores=$(nproc)
-  if awk -v l="$load" -v c="$cores" 'BEGIN{exit !(l > c*0.85)}' && cooldown cpu 900; then
-    say hot "Your CPU is maxed (load $load on $cores cores). Biggest eaters: $(top_cpu)."
+  read_load
+  if (( LOAD100 > CORES * 85 )) && cooldown cpu 900; then
+    say hot "Your CPU is maxed (load $LOAD on $CORES cores)."
   fi
 
-  mem=$(mem_avail_pct)
-  if (( mem < 10 )) && cooldown mem 900; then
-    say alert "Only ${mem}% RAM left! $(top_mem | cut -d, -f1) is hogging it."
-  fi
+  read_mem
+  (( MEM_AVAIL < 10 )) && cooldown mem 900 && say alert "Only ${MEM_AVAIL}% RAM left!"
 
-  disk=$(disk_pct)
-  if (( disk >= 90 )) && cooldown disk 21600; then
-    say alert "Your disk is ${disk}% full. Try 'paccache -rk1' or clearing ~/.cache."
-  fi
+  read_disk
+  (( DISK >= 90 )) && cooldown disk 21600 && say alert "Your disk is ${DISK}% full."
 
-  temp=$(max_temp)
-  if (( temp >= 95 )) && cooldown temp 1800; then
-    say hot "It's getting hot in here: ${temp}°C. $(top_cpu | cut -d, -f1) is the likely culprit."
-  fi
+  (( TEMP >= 95 )) && cooldown temp 1800 && say hot "It's getting hot in here: ${TEMP}°C."
 
-  read -r pct status <<<"$(battery)"
-  if [[ -n ${pct:-} ]]; then
-    if [[ $status == Discharging ]]; then
-      rm -f "$STATE/cd.batfull"
-      if (( pct <= 10 )) && cooldown batcrit 600; then
-        say alert "Battery at ${pct}%! Plug in now or save your work."
-      elif (( pct <= 20 )) && cooldown batlow 1800; then
-        say alert "Battery's at ${pct}%. A charger soon would be nice."
+  read_battery
+  if [[ -n $BAT_PCT ]]; then
+    if [[ $BAT_STATUS == Discharging ]]; then
+      [[ -f $STATE/cd.batfull ]] && rm -f "$STATE/cd.batfull"
+      if (( BAT_PCT <= 10 )) && cooldown batcrit 600; then say alert "Battery at ${BAT_PCT}%!"
+      elif (( BAT_PCT <= 20 )) && cooldown batlow 1800; then say alert "Battery at ${BAT_PCT}%."
       fi
     else
-      rm -f "$STATE/cd.batlow" "$STATE/cd.batcrit"
-      [[ $status == Full ]] && cooldown batfull 86400 >/dev/null && say happy "Fully charged! You can unplug me."
+      [[ -f $STATE/cd.batlow || -f $STATE/cd.batcrit ]] && rm -f "$STATE/cd.batlow" "$STATE/cd.batcrit"
+      [[ $BAT_STATUS == Full ]] && cooldown batfull 86400 && say happy ""
     fi
   fi
 
-  failed=$(failed_units)
-  known=$(cat "$STATE/failed_known" 2>/dev/null)
-  new_failed=""
-  for u in $failed; do [[ " $known " == *" $u "* ]] || new_failed+="$u "; done
-  echo "$failed" >"$STATE/failed_known"
+  read_failed
+  local known u new_failed=""
+  readf known "$STATE/failed_known"
+  for u in $FAILED; do [[ " $known " == *" $u "* ]] || new_failed+="$u "; done
+  [[ $FAILED == "$known" ]] || printf '%s\n' "$FAILED" >"$STATE/failed_known"
   [[ -n $new_failed ]] && say spooky "A service just failed: ${new_failed% }."
 
-  local brk; brk=$(setting breakMinutes 50)
-  if (( brk > 0 && STREAK_MIN >= brk )) && (( IDLE_SECS < 60 )) && cooldown break $(( brk * 60 )); then
+  local brk=${CFG[breakMinutes]:-50}
+  if (( brk > 0 && STREAK_MIN >= brk && ACTIVE )) && cooldown break $(( brk * 60 )); then
     say calm ""
     remind "Time for a break" "You've been at it for ${STREAK_MIN} minutes. Stretch, drink some water, and look at something 6 m away for 20 s."
   fi
 
-  hour=$(date +%-H)
-  if enabled lateNight true && (( hour >= 1 && hour < 5 )) && (( IDLE_SECS < 60 )) && cooldown latenight 14400; then
-    remind "It's $(date +%H:%M)" "Even $(species_label "$SPECIES") is asleep by now. Save your work and get some rest?"
+  if enabled lateNight true && (( hour >= 1 && hour < 5 && ACTIVE )) && cooldown latenight 14400; then
+    local hm; printf -v hm '%(%H:%M)T' -1
+    remind "It's $hm" "Even $(species_label "$SPECIES") is asleep by now. Save your work and get some rest?"
   fi
   return 0
 }
@@ -376,8 +502,7 @@ cmd_sense() {
 # focuses the app if it already has a window, otherwise starts it through
 # uwsm like the Omarchy launcher does. Exit 3 = nothing matched.
 # ---------------------------------------------------------------------------
-SELF="$(readlink -f "$0")"
-APPS="$(dirname "$SELF")/eevee-apps.py"
+APPS="$PLUGIN_DIR/bin/eevee-apps.py"
 
 focus_existing() { # focus_existing <pattern>... -> 0 if a window was focused
   local p addr
@@ -450,18 +575,6 @@ Pick the best fit and launch it with the launch command. If nothing fits, say so
   # A direct hit needs no words (the app appearing is the answer); only
   # "couldn't find" messages are worth showing.
   (( rc == 0 )) || echo "$out"
-}
-
-# ---------------------------------------------------------------------------
-# Screen state, polled every few seconds by the sprite: a fullscreen window
-# covers Eevee (Omarchy's own popups take over), and while the screen is
-# shared or recorded she hides so notifications don't leak into it.
-# ---------------------------------------------------------------------------
-cmd_screen() { # "<fullscreen 0|1> <recording 0|1>"; portal shares are watched in QML
-  local fs rec=0
-  fs=$(hyprctl activewindow -j 2>/dev/null | jq -r '(.fullscreen // 0) >= 2 | if . then 1 else 0 end' 2>/dev/null)
-  pgrep -x 'gpu-screen-reco|wf-recorder|obs' >/dev/null && rec=1
-  echo "${fs:-0} $rec"
 }
 
 # ---------------------------------------------------------------------------
@@ -563,6 +676,7 @@ cmd_done() {
   local short=$cmd
   (( ${#short} > 60 )) && short="${short:0:57}…"
   local title urgency=normal
+  xp_gain $(( status == 0 ? 10 : 5 )) >/dev/null
   if (( status == 0 )); then title="✓ Done: $short"
   else title="✗ Failed (exit $status): $short"; urgency=critical
   fi
@@ -612,7 +726,10 @@ cmd_forget() {
 # ---------------------------------------------------------------------------
 # Talking: Claude Haiku, sandboxed to read-only tools, with live context.
 # ---------------------------------------------------------------------------
-NAME=$(species_label "$SPECIES")
+NAME=Eevee
+if [[ ${1:-} == ask || ${1:-} == open ]]; then # only chat needs the (jq) label
+  xp_load; level_of "${XP[$SPECIES]:-16}"; stage_of "$SPECIES" "$LEVEL"; NAME=$(species_label "$STAGE")
+fi
 SYSTEM_PROMPT="You are $NAME, a small, friendly Pokémon who lives at the bottom of the user's screen on an Omarchy Linux desktop (Arch Linux + Hyprland, Quickshell-based shell; Omarchy commands are under \`omarchy <group> <action>\`, sources in /usr/share/omarchy, user config in ~/.config). You are a genuinely useful assistant: answer questions, explain errors, diagnose the system, look things up.
 Rules:
 - Your reply is shown in a small speech bubble. Be brief: usually 1-4 short sentences, at most ~90 words. Plain text only: no markdown headings, tables, bold or \`\`\` code fences. Short inline \`code\` is fine; put a command the user should run on its own line.
@@ -648,7 +765,7 @@ cmd_ask() {
   enabled ai true || return 0
   claude=$(find_claude) || { echo "I can't find the claude CLI, so I can only watch your system for now."; return 0; }
 
-  if [[ -f $sid_file ]] && (( $(now) - $(stat -c %Y "$sid_file") < SESSION_TTL )); then
+  if [[ -f $sid_file ]] && (( EPOCHSECONDS - $(stat -c %Y "$sid_file") < SESSION_TTL )); then
     sid=$(cat "$sid_file")
   fi
 
@@ -697,24 +814,25 @@ User: $question"
   if [[ -z $answer ]]; then
     echo "Vee... I couldn't reach my brain just now. ($(head -c 160 "$RUN/ask.err" | tr '\n' ' '))"
   else
+    xp_gain 3 >/dev/null
     # Bubble is plain text: drop code fences and markdown emphasis, squeeze blank lines.
     printf '%s\n' "$answer" | sed -E '/^[[:space:]]*```/d; s/\*\*([^*]+)\*\*/\1/g; s/^#+ //' | cat -s
   fi
 }
 
 case "${1:-}" in
-  sense) cmd_sense ;;
+  sense) shift; cmd_sense "$@" ;;
   context) cmd_context ;;
   ask) shift; cmd_ask "$*" ;;
   evolve) shift; cmd_evolve "${1:-}" ;;
   devolve) cmd_evolve eevee ;;
   pet) cmd_pet ;;
-  screen) cmd_screen ;;
   remember) shift; cmd_remember "$*" ;;
   forget) shift; cmd_forget "$*" ;;
   lockscreen) shift; cmd_lockscreen "${1:-status}" ;;
   hover) cmd_hover ;;
   cmd-done) shift; cmd_done "$@" ;;
+  xp) shift; cmd_xp "${1:-}" ;;
   cmdhook) shift; cmd_cmdhook "${1:-status}" ;;
   form) form_now ;;
   launch) shift; cmd_launch "$*" ;;

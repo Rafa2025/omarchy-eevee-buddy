@@ -51,6 +51,7 @@ Item {
   readonly property var defaults: ({
     species: "eevee", shiny: "rare", screen: "follow", size: 3, wander: true,
     music: true, musicControls: true, hoverStatus: true, evolution: true, longCommandSeconds: 30, attacks: true,
+    everstone: false, reduceMotion: false,
     notifications: true, noteSeconds: 5, holdWhileAway: true, hideWhenSharing: true,
     ai: true, model: "claude-haiku-4-5", screenshots: true,
     reactions: true, breakMinutes: 50, lateNight: true
@@ -167,7 +168,55 @@ Item {
       if (root.speciesList[i].id === root.species) return root.speciesList[i].label
     return root.pretty(root.species)
   }
-  onSpeciesChanged: if (!root.evolving) root.shownForm = root.evolves ? root.form : root.species
+  // Levels (from the brain): other species evolve for good as they level up;
+  // stage is the evolution they've reached (Charmander -> Charmeleon ...).
+  property int level: 5
+  property int levelXp: 0
+  property int levelNeed: 1
+  property string stage: ""
+  property string nextStage: ""
+  property int nextAt: 0
+  property bool stageSynced: false
+  readonly property string buddyForm: root.evolves ? root.form : (root.forms[root.stage] ? root.stage : root.species)
+  onSpeciesChanged: {
+    root.stageSynced = false
+    root.stage = ""
+    if (!root.evolving) root.shownForm = root.buddyForm
+    root.gainXp(0) // fetch the new Pokémon's level right away
+  }
+
+  function handleLevel(msg) {
+    var f = String(msg).split("\t")
+    root.level = parseInt(f[0]) || 5
+    root.levelXp = parseInt(f[1]) || 0
+    root.levelNeed = Math.max(1, parseInt(f[2]) || 1)
+    var st = f[3] || root.species
+    root.nextStage = f[4] || ""
+    root.nextAt = parseInt(f[5]) || 0
+    if (root.evolves) { root.stage = st; return }
+    if (!root.stageSynced || !root.forms[st]) {
+      root.stageSynced = true
+      root.stage = st
+      if (!root.evolving) root.shownForm = root.buddyForm
+    } else if (st !== root.stage) {
+      var from = root.shownForm
+      root.stage = st
+      if (root.evolving || root.chatOpen || root.thinking) root.shownForm = st
+      else root.playEvolution(from, st)
+    }
+  }
+
+  // XP from things that happen here (a finished focus session); gainXp(0)
+  // just refreshes the level line.
+  function gainXp(n) {
+    if (xpProc.running) return
+    xpProc.command = ["bash", root.brain, "xp"].concat(n > 0 ? [String(Math.round(n))] : [])
+    xpProc.running = true
+  }
+  Process {
+    id: xpProc
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.handleBrainLines(String(text || "")) }
+  }
   property bool shinyToday: false
   readonly property bool shiny: root.settings.shiny === "always" || (root.settings.shiny !== "never" && root.shinyToday)
 
@@ -228,7 +277,23 @@ Item {
   property real posX: 0 // placed once the screen size is known
   property real targetX: root.posX
   property bool walking: false
-  property bool userAway: false
+  // Activity is event-driven (Wayland idle notifications, which also honour
+  // inhibitors such as a playing video): asleep after 4 idle minutes; five
+  // idle minutes end a work streak; ten or more count as a break.
+  readonly property bool userAway: idleAway.isIdle
+  property real streakStart: Date.now()
+  property real idleSince: 0
+  property bool backFromBreak: false
+  IdleMonitor { id: idleShort; timeout: 60 }
+  IdleMonitor { id: idleAway; timeout: 240 }
+  IdleMonitor {
+    timeout: 300
+    onIsIdleChanged: {
+      if (isIdle) { root.idleSince = Date.now() - 300000; return }
+      if (Date.now() - root.idleSince >= 600000) root.backFromBreak = true
+      root.streakStart = Date.now()
+    }
+  }
   property bool thinking: false
   property bool chatOpen: false
   property bool evolving: false
@@ -378,7 +443,7 @@ Item {
     root.walking = false
     if (root.thinking) root.play("Nod")
     else if (root.userAway) root.play("Sleep")
-    else if (root.musicPlaying) root.play("Nod") // bopping along
+    else if (root.musicPlaying && !root.settings.reduceMotion) root.play("Nod") // bopping along
     else root.play("Idle")
   }
 
@@ -395,6 +460,12 @@ Item {
     if (Math.random() < root.friendship * 0.025) {
       root.play("Pose")
       behaviourTimer.restartIn(3000 + Math.random() * 4000)
+      return
+    }
+    // Reduce motion: no wandering, bopping or posing, just the odd sit.
+    if (root.settings.reduceMotion) {
+      root.play(Math.random() < 0.3 ? "Sit" : "Idle")
+      behaviourTimer.restartIn(8000 + Math.random() * 8000)
       return
     }
     if (!root.settings.wander && r < 0.55) r = 0.55 + Math.random() * 0.45
@@ -434,7 +505,9 @@ Item {
     eevee: ["normal"], vaporeon: ["water"], jolteon: ["electric"], flareon: ["fire"],
     espeon: ["psychic"], umbreon: ["dark"], leafeon: ["grass"], glaceon: ["ice"], sylveon: ["fairy"],
     pikachu: ["electric"], charmander: ["fire"], bulbasaur: ["grass"], squirtle: ["water"],
-    psyduck: ["water", "psychic"], munchlax: ["normal"], snorlax: ["normal"], gengar: ["ghost"]
+    psyduck: ["water", "psychic"], munchlax: ["normal"], snorlax: ["normal"], gengar: ["ghost"],
+    charmeleon: ["fire"], charizard: ["fire"], ivysaur: ["grass"], venusaur: ["grass"],
+    wartortle: ["water"], blastoise: ["water"], raichu: ["electric"], golduck: ["water", "psychic"]
   })
   readonly property var types: root.typesOf[root.shownForm] || ["normal"]
   // Which event calls for which type. "any" means every Pokémon joins in.
@@ -472,6 +545,7 @@ Item {
   }
 
   function attack(type) {
+    if (root.settings.reduceMotion) return
     if (root.attacking || root.chatOpen || root.evolving || root.hidden || root.actionsOpen) return
     root.attackType = type || root.types[0]
     root.attackSeed = Math.random() * 1000
@@ -558,7 +632,6 @@ Item {
   property real whiteness: 0
   property string evolveFrom: ""
   property string evolveTarget: ""
-  property string evolveMessage: ""
 
   function evolveTo(target, message) {
     if (!root.evolves || !root.forms[target] || target === root.form) return
@@ -566,14 +639,16 @@ Item {
       if (!root.evolving) root.pendingEvolution = { target: target, message: message }
       return
     }
-    root.evolveFrom = root.form
-    root.evolveTarget = target
-    root.evolveMessage = message || (target === "eevee"
-      ? root.pretty(root.form) + " turned back into Eevee. Vee!"
-      : "Eevee evolved into " + root.pretty(target) + "!")
+    var from = root.shownForm
     root.form = target
-    root.speechQueue = []
-    speechTimer.stop()
+    root.playEvolution(from, target)
+  }
+
+  // The evolution sequence, for Eevee's moods and level evolutions alike.
+  function playEvolution(from, to) {
+    if (root.settings.reduceMotion) { root.shownForm = to; return }
+    root.evolveFrom = from
+    root.evolveTarget = to
     root.walking = false
     root.evolving = true
     root.play("Idle")
@@ -608,7 +683,7 @@ Item {
       script: {
         root.evolving = false
         root.react("happy")
-        sparkleBurst.restart()
+        if (!root.settings.reduceMotion) sparkleBurst.restart()
       }
     }
   }
@@ -667,6 +742,7 @@ Item {
   }
 
   function moodAnim(mood) {
+    if (root.settings.reduceMotion) return mood === "sleepy" ? "Sleep" : "Idle"
     return mood === "alert" ? "Hop" : mood === "happy" ? "Hop" : mood === "think" ? "LookUp"
       : mood === "sleepy" ? "Sleep" : mood === "calm" ? "Sit" : "Pose"
   }
@@ -834,6 +910,7 @@ Item {
 
   function startFocus(minutes) {
     minutes = Math.max(1, Math.min(480, Math.round(Number(minutes) || 25)))
+    root.focusMinutes = minutes
     root.focusUntil = Date.now() + minutes * 60000
     focusEnd.interval = minutes * 60000
     focusEnd.restart()
@@ -850,7 +927,9 @@ Item {
     root.releaseHeld("During focus")
   }
 
-  Timer { id: focusEnd; onTriggered: root.endFocus() }
+  // A focus session that runs its course is worth 2 XP a minute.
+  property int focusMinutes: 0
+  Timer { id: focusEnd; onTriggered: { root.gainXp(root.focusMinutes * 2); root.endFocus() } }
 
   Process {
     id: notifyWatch
@@ -901,14 +980,8 @@ Item {
 
   Process {
     id: screenProc
-    command: ["bash", root.brain, "screen"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var p = String(text || "").trim().split(" ")
-        root.recording = p[1] === "1"
-      }
-    }
+    command: ["pgrep", "-x", "gpu-screen-reco|wf-recorder|obs"]
+    onExited: function(code) { root.recording = code === 0 }
   }
 
   // Unprompted events (alerts, pets, evolution) only animate; speech bubbles
@@ -923,7 +996,7 @@ Item {
   function pet() {
     if (root.attackFor("pet") !== "") root.attack("fairy")
     else root.react("happy")
-    heartBurst.restart()
+    if (!root.settings.reduceMotion) heartBurst.restart()
     // Enough affection evolves Eevee into Sylveon.
     Quickshell.execDetached(["bash", root.brain, "pet"])
   }
@@ -1006,20 +1079,23 @@ Item {
     }
   }
 
-  Process {
-    id: senseProc
-    command: ["bash", root.brain, "sense"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var away = false
+  function sense() {
+    if (senseProc.running) return
+    senseProc.command = ["bash", root.brain, "sense", idleShort.isIdle ? "0" : "1",
+      String(Math.floor((Date.now() - root.streakStart) / 60000)), root.backFromBreak ? "1" : "0"]
+    root.backFromBreak = false
+    senseProc.running = true
+  }
+
+  // Lines from the brain: "mood<TAB>message", plus form/friend/shiny/level.
+  function handleBrainLines(text) {
         var lines = String(text || "").split("\n")
         for (var i = 0; i < lines.length; i++) {
           if (lines[i] === "") continue
           var tab = lines[i].indexOf("\t")
           var mood = tab < 0 ? lines[i] : lines[i].slice(0, tab)
           var msg = tab < 0 ? "" : lines[i].slice(tab + 1)
-          if (mood === "sleepy" && msg === "") { away = true; continue }
+          if (mood === "level") { root.handleLevel(msg); continue }
           if (mood === "friend") { root.friendship = parseInt(msg) || 0; continue }
           if (mood === "form") {
             var tab2 = msg.indexOf("\t")
@@ -1030,7 +1106,7 @@ Item {
               root.formSynced = true
               if (root.forms[target]) {
                 root.form = target
-                root.shownForm = root.evolves ? target : root.species
+                if (!root.evolving) root.shownForm = root.buddyForm
               }
             } else if (target !== root.form) {
               root.evolveTo(target, why)
@@ -1045,9 +1121,11 @@ Item {
           }
           if (root.settings.reactions) root.react(mood)
         }
-        root.userAway = away
-      }
-    }
+  }
+
+  Process {
+    id: senseProc
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.handleBrainLines(String(text || "")) }
   }
 
   Timer {
@@ -1055,10 +1133,7 @@ Item {
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: {
-      if (!senseProc.running) senseProc.running = true
-      root.checkScreen()
-    }
+    onTriggered: { root.sense(); root.checkScreen() }
   }
 
   Timer {
@@ -1095,7 +1170,8 @@ Item {
         asking: askProc.running, form: root.form, shown: root.shownForm, evolving: root.evolving,
         forms: Object.keys(root.forms).length, screen: root.screenName, fullscreen: root.fullscreen,
         sharing: root.sharing, recording: root.recording, portalSharing: root.portalSharing,
-        species: root.species, shiny: root.shiny,
+        species: root.species, stage: root.stage, level: root.level, xp: root.levelXp + "/" + root.levelNeed,
+        shiny: root.shiny,
         actionsOpen: root.actionsOpen, hoverCard: root.controlsVisible, focusing: root.focusing, held: root.heldNotes.length, music: root.musicPlaying,
         friendship: root.friendship, note: root.speechNote ? root.speechNote.app : null,
         notifyWatch: notifyWatch.running })

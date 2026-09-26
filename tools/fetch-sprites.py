@@ -27,6 +27,11 @@ SPECIES = {
 EEVEELUTIONS = {"vaporeon": "0134", "jolteon": "0135", "flareon": "0136",
                 "espeon": "0196", "umbreon": "0197", "leafeon": "0470",
                 "glaceon": "0471", "sylveon": "0700"}
+# Later evolution stages, reached by levelling up (see bin/eevee-brain).
+STAGES = {"charmeleon": ("0005", "Charmeleon"), "charizard": ("0006", "Charizard"),
+          "ivysaur": ("0002", "Ivysaur"), "venusaur": ("0003", "Venusaur"),
+          "wartortle": ("0008", "Wartortle"), "blastoise": ("0009", "Blastoise"),
+          "raichu": ("0026", "Raichu"), "golduck": ("0055", "Golduck")}
 ANIMS = ["Walk", "Idle", "Sleep", "Hop", "Eat", "Sit", "Nod", "LookUp", "Pose", "Charge", "Shoot", "Attack"]
 LOOPS = {"Walk", "Idle", "Sleep", "Nod"}
 out_dir = pathlib.Path(__file__).resolve().parent.parent / "forms"
@@ -103,7 +108,8 @@ def write_credits():
         return ", ".join(out) or "unknown"
 
     rows = []
-    sets = [(k, v[0], v[1]) for k, v in SPECIES.items()] + [(k, v, k.capitalize()) for k, v in EEVEELUTIONS.items()]
+    sets = ([(k, v[0], v[1]) for k, v in SPECIES.items()] + [(k, v, k.capitalize()) for k, v in EEVEELUTIONS.items()]
+            + [(k, v[0], v[1]) for k, v in STAGES.items()])
     for name, num, label in sets:
         rows.append(f"| {label} | #{int(num)} | {who(authors(num))} | {who(authors(f'{num}/0000/0001'))} |")
         print("credits", name)
@@ -126,7 +132,12 @@ if "--credits" not in sys.argv:
         meta[name] = fetch(name, num)
     for name, num in EEVEELUTIONS.items():
         meta[name] = fetch(name, num)
+    for name, (num, _label) in STAGES.items():
+        meta[name] = fetch(name, num)
     (out_dir / "forms.json").write_text(json.dumps(meta, indent=1) + "\n")
     (out_dir / "species.json").write_text(json.dumps(
         [{"id": k, "label": v[1], "evolves": k == "eevee"} for k, v in SPECIES.items()], indent=1) + "\n")
+    (out_dir / "labels.json").write_text(json.dumps(
+        {**{k: v[1] for k, v in SPECIES.items()}, **{k: k.capitalize() for k in EEVEELUTIONS},
+         **{k: v[1] for k, v in STAGES.items()}}, indent=1) + "\n")
 write_credits()
