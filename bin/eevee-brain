@@ -10,7 +10,7 @@
 #   eevee-brain open <request>   launch; if nothing matches, let Claude pick
 #   eevee-brain reset            forget the chat session
 #   eevee-brain evolve [form]    evolve now (random fitting form if omitted)
-#   eevee-brain devolve          turn back into Eevee
+#   eevee-brain devolve          turn back from an evolution
 #   eevee-brain pet              record a pet (affection -> Sylveon)
 #   eevee-brain remember <fact>  keep a fact across chats (forget [text] drops)
 #   eevee-brain lockscreen [on|off|status]   Eevee napping on the lock screen
@@ -185,11 +185,25 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Eevee's moods. The brain owns her current form (persisted, survives
-# restarts). Each Eeveelution has a trigger rooted in something real;
-# evolving is rare ("sometimes"), and the form wears off after 20-40 min.
+# Evolution. The brain owns her current form (persisted, survives restarts).
+# Every buddy with an evolution line evolves for a while when something real
+# calls for it, and turns back after 20-40 minutes:
+#   Eevee: Flareon when hot, Jolteon under load or charging, Glaceon when
+#     cool, Umbreon at night, Espeon by day, Leafeon in the morning,
+#     Vaporeon after a break, Sylveon after lots of pets.
+#   Charmander -> Charmeleon/Charizard when the CPU runs hot; Squirtle ->
+#   Wartortle/Blastoise and Psyduck -> Golduck after a break; Bulbasaur ->
+#   Ivysaur/Venusaur in the morning; Pikachu -> Raichu while charging;
+#   Munchlax -> Snorlax after lots of pets.
+# Besides those, any of her forms can come up on a rare roll.
 # ---------------------------------------------------------------------------
-FORMS=(vaporeon jolteon flareon espeon umbreon leafeon glaceon sylveon)
+declare -A LINE=(
+  [eevee]="vaporeon jolteon flareon espeon umbreon leafeon glaceon sylveon"
+  [charmander]="charmeleon charizard" [bulbasaur]="ivysaur venusaur"
+  [squirtle]="wartortle blastoise" [pikachu]="raichu" [psyduck]="golduck"
+  [munchlax]="snorlax"
+)
+read -r -a FORMS <<<"${LINE[$SPECIES]-}"
 declare -A FORM_REASON=(
   [flareon]="Your CPU is running hot, so the heat did it! 🔥"
   [jolteon]="All that electricity went straight to my fur! ⚡"
@@ -199,12 +213,21 @@ declare -A FORM_REASON=(
   [leafeon]="Fresh morning air, just like a Moss Rock! 🍃"
   [vaporeon]="You took a break. Refreshing, like water! 💧"
   [sylveon]="All those pets! Pure affection! 🎀"
+  [charmeleon]="All that heat stoked the flame! 🔥" [charizard]="The CPU's on fire, and so is the tail! 🔥"
+  [wartortle]="Back from a break, refreshed like water! 💧" [blastoise]="Fully refreshed: cannons ready! 💧"
+  [golduck]="A clear head after that break! 💧"
+  [ivysaur]="Morning sun makes the bulb grow! 🍃" [venusaur]="Full bloom in the morning light! 🌸"
+  [raichu]="Charging up: Thunder Stone energy! ⚡"
+  [snorlax]="All those pets... time for a big nap! 💤"
 )
 
-read_form() { # FORM, FORM_UNTIL
+in_line() { [[ " ${FORMS[*]} " == *" $1 "* ]]; }
+
+read_form() { # FORM (a form of the current buddy, or the buddy itself), FORM_UNTIL
   FORM="" FORM_UNTIL=0
   { IFS=$'\t' read -r FORM FORM_UNTIL <"$STATE/form"; } 2>/dev/null
-  FORM=${FORM:-eevee}; FORM_UNTIL=${FORM_UNTIL:-0}
+  FORM_UNTIL=${FORM_UNTIL:-0}
+  in_line "${FORM:-}" || { FORM=$SPECIES; FORM_UNTIL=0; }
 }
 form_now() { read_form; echo "$FORM"; }
 
@@ -216,31 +239,48 @@ set_form() { # set_form <form> <minutes-to-last>
 pretty() { echo "${1^}"; }
 
 evolve_message() { # evolve_message <from> <to> [reason]
-  if [[ $2 == eevee ]]; then
-    echo "$(pretty "$1") turned back into Eevee. Vee!"
+  if [[ $2 == "$SPECIES" ]]; then
+    echo "$(pretty "$1") turned back into $(pretty "$SPECIES")."
   else
-    echo "Eevee evolved into $(pretty "$2")! ${3:-${FORM_REASON[$2]}}"
+    echo "$(pretty "$SPECIES") evolved into $(pretty "$2")! ${3:-${FORM_REASON[$2]-}}"
   fi
 }
 
-# CANDS: forms that fit right now, strongest reasons first.
+# EARNED: a form something real calls for right now (evolves promptly);
+# CANDS: forms that fit, for the rare roll.
 evolution_candidates() {
-  CANDS=()
+  CANDS=() EARNED=""
   read_temp; read_load; read_battery
   local hour pets=0 t
   printf -v hour '%(%H)T' -1; hour=$((10#$hour))
   if [[ -f $STATE/pets ]]; then
     while read -r t; do (( t > EPOCHSECONDS - 3600 )) && (( pets++ )); done <"$STATE/pets"
   fi
-  (( pets >= 5 )) && CANDS+=(sylveon)
-  (( BACK )) && CANDS+=(vaporeon)
-  (( TEMP >= 90 )) && CANDS+=(flareon)
-  (( LOAD100 > CORES * 60 )) && CANDS+=(jolteon)
-  [[ $BAT_STATUS == Charging ]] && CANDS+=(jolteon)
-  (( TEMP > 0 && TEMP < 55 )) && CANDS+=(glaceon)
-  (( hour >= 20 || hour < 5 )) && CANDS+=(umbreon)
-  (( hour >= 9 && hour < 17 )) && CANDS+=(espeon)
-  (( hour >= 5 && hour < 9 )) && CANDS+=(leafeon)
+  local hot=0 busy=0 charging=0 morning=0
+  (( TEMP >= 90 )) && hot=1
+  (( LOAD100 > CORES * 60 )) && busy=1
+  [[ $BAT_STATUS == Charging ]] && charging=1
+  (( hour >= 5 && hour < 9 )) && morning=1
+  case $SPECIES in
+    eevee)
+      (( pets >= 5 )) && EARNED=sylveon
+      (( BACK )) && [[ -z $EARNED ]] && EARNED=vaporeon
+      (( hot )) && CANDS+=(flareon)
+      (( busy || charging )) && CANDS+=(jolteon)
+      (( TEMP > 0 && TEMP < 55 )) && CANDS+=(glaceon)
+      (( hour >= 20 || hour < 5 )) && CANDS+=(umbreon)
+      (( hour >= 9 && hour < 17 )) && CANDS+=(espeon)
+      (( morning )) && CANDS+=(leafeon)
+      ;;
+    charmander) (( hot )) && EARNED=charizard; (( busy )) && [[ -z $EARNED ]] && EARNED=charmeleon ;;
+    squirtle) (( BACK )) && EARNED=wartortle ;;
+    psyduck) (( BACK )) && EARNED=golduck ;;
+    bulbasaur) (( morning )) && EARNED=ivysaur ;;
+    pikachu) (( charging )) && EARNED=raichu ;;
+    munchlax) (( pets >= 5 )) && EARNED=snorlax ;;
+  esac
+  # Any other buddy form can still come up on the roll.
+  [[ $SPECIES == eevee ]] || CANDS=("${FORMS[@]}")
   return 0
 }
 
@@ -248,53 +288,58 @@ evolution_candidates() {
 evolution_tick() {
   local pick=""
   read_form
-  if [[ $FORM != eevee ]]; then
+  if [[ $FORM != "$SPECIES" ]]; then
     if (( EPOCHSECONDS >= FORM_UNTIL )); then
-      set_form eevee 0
-      printf 'form\teevee\t%s\n' "$(evolve_message "$FORM" eevee)"
+      set_form "$SPECIES" 0
+      printf 'form\t%s\t%s\n' "$SPECIES" "$(evolve_message "$FORM" "$SPECIES")"
     else
       printf 'form\t%s\t\n' "$FORM"
     fi
     return
   fi
-  if [[ $SPECIES != eevee ]] || ! enabled evolution true; then
-    printf 'form\teevee\t\n'
+  if (( ${#FORMS[@]} == 0 )) || ! enabled evolution true; then
+    printf 'form\t%s\t\n' "$SPECIES"
     return
   fi
 
   evolution_candidates
   friend_level
-  # Sylveon/Vaporeon are earned, so they fire promptly; the rest are a
-  # ~1-in-40 roll per 20 s tick (about every 15 min) after a 25 min rest;
-  # a close friend rolls more often (down to 1-in-20).
-  if (( ${#CANDS[@]} )) && [[ ${CANDS[0]} == sylveon || ${CANDS[0]} == vaporeon ]] && cooldown evolve-earned 1200; then
-    pick=${CANDS[0]}
+  # Earned forms fire promptly; the rest are a ~1-in-40 roll per 20 s tick
+  # (about every 15 min) after a 25 min rest; a close friend rolls more often
+  # (down to 1-in-20).
+  if [[ -n $EARNED ]] && cooldown evolve-earned 1200; then
+    pick=$EARNED
   elif (( ${#CANDS[@]} )) && (( RANDOM % (40 - 2 * FRIEND) == 0 )) && cooldown evolve 1500; then
     pick=${CANDS[RANDOM % ${#CANDS[@]}]}
   fi
   if [[ -n $pick ]]; then
     set_form "$pick" $(( 20 + RANDOM % 21 ))
-    [[ $pick == sylveon ]] && : >"$STATE/pets"
-    printf 'form\t%s\t%s\n' "$pick" "$(evolve_message eevee "$pick")"
+    [[ $pick == sylveon || $pick == snorlax ]] && : >"$STATE/pets"
+    printf 'form\t%s\t%s\n' "$pick" "$(evolve_message "$SPECIES" "$pick")"
   else
-    printf 'form\teevee\t\n'
+    printf 'form\t%s\t\n' "$SPECIES"
   fi
 }
 
 cmd_evolve() {
   local want="${1:-}" cur
   cur=$(form_now)
+  if (( ${#FORMS[@]} == 0 )); then
+    echo "$(pretty "$SPECIES") doesn't evolve." >&2; return 1
+  fi
   if [[ -z $want ]]; then
     BACK=0; evolution_candidates
+    [[ -n $EARNED ]] && CANDS=("$EARNED" "${CANDS[@]}")
     (( ${#CANDS[@]} )) || CANDS=("${FORMS[@]}")
     want=${CANDS[RANDOM % ${#CANDS[@]}]}
   fi
   want=${want,,}
-  if [[ $want != eevee && " ${FORMS[*]} " != *" $want "* ]]; then
-    echo "Eevee can't evolve into '$want'. Try: ${FORMS[*]}" >&2; return 1
+  [[ $want == eevee || $want == base ]] && want=$SPECIES
+  if [[ $want != "$SPECIES" ]] && ! in_line "$want"; then
+    echo "$(pretty "$SPECIES") can't evolve into '$want'. Try: ${FORMS[*]}" >&2; return 1
   fi
   set_form "$want" $(( 20 + RANDOM % 21 ))
-  [[ $want == eevee ]] && evolve_message "$cur" eevee || evolve_message "$cur" "$want" "Evolution on demand!"
+  [[ $want == "$SPECIES" ]] && evolve_message "$cur" "$SPECIES" || evolve_message "$cur" "$want" "Evolution on demand!"
 }
 
 cmd_pet() {
@@ -355,7 +400,7 @@ cmd_sense() {
   shiny_today; printf 'shiny\t%s\n' "$SHINY"
   # What's on screen, for the lock screen design: "<sprite set>\t<shiny 0|1>".
   local sprite old
-  if [[ $SPECIES == eevee ]]; then read_form; sprite=$FORM; else sprite=$SPECIES; fi
+  read_form; sprite=$FORM
   readf old "$STATE/sprite"
   [[ $old == "$sprite"$'\t'"$SHINY" ]] || printf '%s\t%s\n' "$sprite" "$SHINY" >"$STATE/sprite"
 
@@ -665,9 +710,8 @@ ALLOWED_TOOLS=(
 
 cmd_ask() {
   local form; form=$(pretty "$(form_now)")
-  local persona="You are currently in your $form form."
-  [[ $form == Eevee ]] || persona="You are currently $form: you evolved from Eevee and will turn back later. Let a little of $form's flavour show."
-  [[ $SPECIES == eevee ]] || persona="Let a little of $NAME's personality show."
+  local persona="Let a little of $NAME's personality show."
+  [[ $form == "$(pretty "$SPECIES")" ]] || persona="You are currently $form: you evolved from $NAME and will turn back later. Let a little of $form's flavour show."
   local question="$1" claude sid_file="$STATE/session" sid="" out answer
   enabled ai true || return 0
   claude=$(find_claude) || { echo "I can't find the claude CLI, so I can only watch your system for now."; return 0; }

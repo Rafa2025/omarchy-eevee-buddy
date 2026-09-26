@@ -139,8 +139,11 @@ Item {
   // animation (e.g. Sit) fall back to Idle.
   // ---------------------------------------------------------------------
   property var forms: ({})
-  property string form: "eevee"      // the brain's form
-  property string shownForm: "eevee" // what is drawn; flickers while evolving
+  property string form: ""           // the brain's current form
+  // What is drawn: always derived (so it can't go stale when the species
+  // changes), except while the evolution flicker runs.
+  property string flickerForm: ""
+  readonly property string shownForm: root.evolving ? root.flickerForm : root.buddyForm
   property bool formSynced: false
 
   FileView {
@@ -161,14 +164,20 @@ Item {
     onLoaded: { try { root.speciesList = JSON.parse(text()) } catch (e) { root.speciesList = [] } }
   }
   readonly property string species: root.forms[root.settings.species] ? root.settings.species : "eevee"
-  readonly property bool evolves: root.species === "eevee"
+  // Forms she can evolve into (forms/species.json): Eevee's eight, Charmander's
+  // Charmeleon and Charizard, ... Empty for Snorlax and Gengar.
+  readonly property var speciesForms: {
+    for (var i = 0; i < root.speciesList.length; i++)
+      if (root.speciesList[i].id === root.species) return root.speciesList[i].forms || []
+    return []
+  }
+  readonly property bool evolves: root.speciesForms.length > 0
   readonly property string speciesLabel: {
     for (var i = 0; i < root.speciesList.length; i++)
       if (root.speciesList[i].id === root.species) return root.speciesList[i].label
     return root.pretty(root.species)
   }
-  readonly property string buddyForm: root.evolves ? root.form : root.species
-  onSpeciesChanged: if (!root.evolving) root.shownForm = root.buddyForm
+  readonly property string buddyForm: root.speciesForms.indexOf(root.form) !== -1 ? root.form : root.species
   property bool shinyToday: false
   readonly property bool shiny: root.settings.shiny === "always" || (root.settings.shiny !== "never" && root.shinyToday)
 
@@ -457,7 +466,9 @@ Item {
     eevee: ["normal"], vaporeon: ["water"], jolteon: ["electric"], flareon: ["fire"],
     espeon: ["psychic"], umbreon: ["dark"], leafeon: ["grass"], glaceon: ["ice"], sylveon: ["fairy"],
     pikachu: ["electric"], charmander: ["fire"], bulbasaur: ["grass"], squirtle: ["water"],
-    psyduck: ["water", "psychic"], munchlax: ["normal"], snorlax: ["normal"], gengar: ["ghost"]
+    psyduck: ["water", "psychic"], munchlax: ["normal"], snorlax: ["normal"], gengar: ["ghost"],
+    charmeleon: ["fire"], charizard: ["fire"], ivysaur: ["grass"], venusaur: ["grass"],
+    wartortle: ["water"], blastoise: ["water"], raichu: ["electric"], golduck: ["water", "psychic"]
   })
   readonly property var types: root.typesOf[root.shownForm] || ["normal"]
   // Which event calls for which type. "any" means every Pokémon joins in.
@@ -584,19 +595,21 @@ Item {
   property string evolveTarget: ""
 
   function evolveTo(target, message) {
-    if (!root.evolves || !root.forms[target] || target === root.form) return
+    if (!root.forms[target] || target === root.form) return
     if (root.evolving || root.chatOpen || root.thinking) {
       if (!root.evolving) root.pendingEvolution = { target: target, message: message }
       return
     }
     var from = root.shownForm
     root.form = target
-    root.playEvolution(from, target)
+    // Only animate a real change of what's on screen.
+    if (root.buddyForm !== from) root.playEvolution(from, root.buddyForm)
   }
 
   // The evolution sequence (white silhouette, flicker, flash).
   function playEvolution(from, to) {
-    if (root.settings.reduceMotion) { root.shownForm = to; return }
+    if (root.settings.reduceMotion) return // shownForm simply follows
+    root.flickerForm = from
     root.evolveFrom = from
     root.evolveTarget = to
     root.walking = false
@@ -615,11 +628,11 @@ Item {
     id: flicker
     repeat: true
     onTriggered: {
-      root.shownForm = root.shownForm === root.evolveTarget ? root.evolveFrom : root.evolveTarget
+      root.flickerForm = root.flickerForm === root.evolveTarget ? root.evolveFrom : root.evolveTarget
       interval = Math.round(interval * 0.84)
       if (interval < 40) {
         stop()
-        root.shownForm = root.evolveTarget
+        root.flickerForm = root.evolveTarget
         evolveFinish.restart()
       }
     }
@@ -989,7 +1002,7 @@ Item {
       return
     }
     var evo = question.match(/^\/(evolve|devolve)\s*(\w*)$/i)
-    if (evo) { root.requestEvolve(evo[1].toLowerCase() === "devolve" ? "eevee" : evo[2].toLowerCase()); return }
+    if (evo) { root.requestEvolve(evo[1].toLowerCase() === "devolve" ? root.species : evo[2].toLowerCase()); return }
     // "open X" skips the AI when X names an installed app; vaguer requests
     // ("open something to edit photos") fall through to Claude in the brain.
     var launch = question.match(/^(?:open|launch|start|run|abre|abrir|abra|inicia)\s+(.+)$/i)
@@ -1050,10 +1063,7 @@ Item {
             if (!root.formSynced) {
               // First tick after (re)load: adopt the form silently.
               root.formSynced = true
-              if (root.forms[target]) {
-                root.form = target
-                if (!root.evolving) root.shownForm = root.buddyForm
-              }
+              if (root.forms[target]) root.form = target
             } else if (target !== root.form) {
               root.evolveTo(target, why)
             }
@@ -1095,9 +1105,16 @@ Item {
     function ask(question: string): void { root.ask(question) }
     function say(text: string): void { root.say(text, "happy") }
     function evolve(form: string): void { root.requestEvolve(form) }
-    function devolve(): void { root.requestEvolve("eevee") }
+    function devolve(): void { root.requestEvolve(root.species) }
     function launch(app: string): void { root.launch(app) }
     function settings(): void { root.openSettings() }
+    // Change a setting the way the settings window does, e.g. `set species pikachu`.
+    function set(key: string, value: string): string {
+      if (!(key in root.defaults)) return "unknown setting"
+      var v = value === "true" ? true : value === "false" ? false : (value !== "" && !isNaN(Number(value)) ? Number(value) : value)
+      root.setSetting(key, v)
+      return "ok"
+    }
     function actions(): void { root.toggleActions() }
     // Attack with a type ("electric", "fire", …) or, empty, her own.
     function attack(type: string): void { root.attack(type) }

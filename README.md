@@ -5,7 +5,7 @@
 A pixel Pokémon that lives along the bottom of your screen on [Omarchy](https://omarchy.org). Eevee by default, or Pikachu, Charmander, Bulbasaur, Squirtle, Psyduck, Munchlax, Snorlax or Gengar. She wanders around, naps when you're away, and:
 
 - **Delivers your notifications** in her speech bubble instead of Omarchy's popups: 5 seconds each, a burst from one app folds into one bubble, and clicking one opens the app that sent it. While you're away, they wait and come back as one "while you were away" summary.
-- **Evolves** (Eevee only) into the Eeveelution that fits the moment: Flareon when the CPU runs hot, Jolteon while charging, Umbreon at night, Espeon by day, Leafeon in the morning, Glaceon when it's cool, Vaporeon after a break, Sylveon after lots of pets. It wears off after 20 to 40 minutes.
+- **Evolves** for a while when something fits, then turns back after 20 to 40 minutes. Eevee picks the Eeveelution for the moment: Flareon when the CPU runs hot, Jolteon while charging, Umbreon at night, Espeon by day, Leafeon in the morning, Glaceon when it's cool, Vaporeon after a break, Sylveon after lots of pets. Charmander becomes Charmeleon or Charizard when the CPU runs hot, Squirtle becomes Wartortle and Psyduck becomes Golduck after a break, Bulbasaur becomes Ivysaur in the morning, Pikachu becomes Raichu while charging, and Munchlax becomes Snorlax after lots of pets. Pick any form yourself with `/evolve`.
 - **Attacks** when an event matches her type: plug in the charger and Pikachu uses Thunderbolt. Fire types react to a hot CPU, Water to you coming back from a break, Grass to the morning, Ice to a cool machine, Ghost and Dark to a failed service, Fairy to pets, Psychic to answering you. Everyone attacks when a long command finishes.
 - **Tells you when long commands finish**, if you've switched to another window: "✓ Done: mvn test · Took 2m 14s", or ✗ with the exit code. Clicking it jumps back to that terminal.
 - **Answers questions** through the [Claude Code](https://claude.com/claude-code) CLI. It can look at your system with read-only tools, open apps, set reminders, remember things you tell it, look at your screen when you ask, and explain files you drop on her.
@@ -58,6 +58,8 @@ omarchy-shell rafa.eevee settings
 omarchy-shell rafa.eevee action lock     # any quick action by name
 omarchy-shell rafa.eevee attack electric # or fire, water, grass, ice, psychic, dark, ghost, fairy, normal
 omarchy-shell rafa.eevee focusMode 50
+omarchy-shell rafa.eevee evolve charizard
+omarchy-shell rafa.eevee set species pikachu   # any setting, like the settings window
 ```
 
 ## Settings

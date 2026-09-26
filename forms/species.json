@@ -2,46 +2,70 @@
  {
   "id": "eevee",
   "label": "Eevee",
-  "evolves": true
+  "forms": [
+   "vaporeon",
+   "jolteon",
+   "flareon",
+   "espeon",
+   "umbreon",
+   "leafeon",
+   "glaceon",
+   "sylveon"
+  ]
  },
  {
   "id": "pikachu",
   "label": "Pikachu",
-  "evolves": false
+  "forms": [
+   "raichu"
+  ]
  },
  {
   "id": "charmander",
   "label": "Charmander",
-  "evolves": false
+  "forms": [
+   "charmeleon",
+   "charizard"
+  ]
  },
  {
   "id": "bulbasaur",
   "label": "Bulbasaur",
-  "evolves": false
+  "forms": [
+   "ivysaur",
+   "venusaur"
+  ]
  },
  {
   "id": "squirtle",
   "label": "Squirtle",
-  "evolves": false
+  "forms": [
+   "wartortle",
+   "blastoise"
+  ]
  },
  {
   "id": "psyduck",
   "label": "Psyduck",
-  "evolves": false
+  "forms": [
+   "golduck"
+  ]
  },
  {
   "id": "munchlax",
   "label": "Munchlax",
-  "evolves": false
+  "forms": [
+   "snorlax"
+  ]
  },
  {
   "id": "snorlax",
   "label": "Snorlax",
-  "evolves": false
+  "forms": []
  },
  {
   "id": "gengar",
   "label": "Gengar",
-  "evolves": false
+  "forms": []
  }
 ]

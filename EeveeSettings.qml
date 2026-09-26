@@ -86,7 +86,6 @@ Scope {
     onLoadFailed: ui.memoryCount = 0
   }
 
-  readonly property var formNames: ["eevee", "vaporeon", "jolteon", "flareon", "espeon", "umbreon", "leafeon", "glaceon", "sylveon"]
   readonly property var modelOptions: [
     { value: "claude-haiku-4-5", label: "Haiku 4.5 · fastest" },
     { value: "claude-sonnet-5", label: "Sonnet 5 · balanced" },
@@ -198,7 +197,7 @@ Scope {
 
             Item {
               id: portrait
-              readonly property string sheet: ui.buddy.forms[ui.buddy.shownForm] ? ui.buddy.shownForm : "eevee"
+              readonly property string sheet: ui.buddy.forms[ui.buddy.shownForm] ? ui.buddy.shownForm : ui.buddy.species
               readonly property var spec: ui.buddy.specOf(sheet, "Idle")
               readonly property int px: 3
               property int frame: 0
@@ -225,7 +224,7 @@ Scope {
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(4)
               Text {
-                text: (ui.buddy.evolves ? ui.buddy.pretty(ui.buddy.form) : ui.buddy.speciesLabel) + (ui.buddy.shiny ? "  ✦" : "")
+                text: ui.buddy.pretty(ui.buddy.shownForm) + (ui.buddy.shiny ? "  ✦" : "")
                 color: ui.fg
                 font.family: ui.fontFamily
                 font.pixelSize: Style.font.iconLarge
@@ -251,7 +250,7 @@ Scope {
               fontFamily: ui.fontFamily
               options: ui.buddy.speciesList.map(function(sp) { return { value: sp.id, label: sp.label } })
               value: ui.buddy.species
-              onChanged: function(v) { ui.set("species", v) }
+              onChanged: function(v) { ui.set("species", v); value = Qt.binding(function() { return ui.buddy.species }) }
             }
           }
 
@@ -264,7 +263,7 @@ Scope {
               accent: ui.accent
               options: [{ value: "rare", label: "Rare" }, { value: "always", label: "Always" }, { value: "never", label: "Never" }]
               value: String(ui.s.shiny)
-              onChanged: function(v) { ui.set("shiny", v) }
+              onChanged: function(v) { ui.set("shiny", v); value = Qt.binding(function() { return String(ui.s.shiny) }) }
             }
           }
 
@@ -277,7 +276,7 @@ Scope {
               fontFamily: ui.fontFamily
               options: ui.screenOptions
               value: String(ui.s.screen)
-              onChanged: function(v) { ui.set("screen", v) }
+              onChanged: function(v) { ui.set("screen", v); value = Qt.binding(function() { return String(ui.s.screen) }) }
             }
           }
 
@@ -289,7 +288,7 @@ Scope {
               accent: ui.accent
               options: [{ value: "2", label: "Small" }, { value: "3", label: "Medium" }, { value: "4", label: "Large" }]
               value: String(ui.s.size)
-              onChanged: function(v) { ui.set("size", Number(v)) }
+              onChanged: function(v) { ui.set("size", Number(v)); value = Qt.binding(function() { return String(ui.s.size) }) }
             }
           }
 
@@ -299,7 +298,14 @@ Scope {
           SettingToggle { key: "music"; label: "Bop to music"; description: "Nod along while a media player is playing." }
           SettingToggle { key: "musicControls"; label: "Music controls on hover"; description: "Hover over her to see the track with previous, play/pause and next (Spotify or any media player)." }
           SettingToggle { key: "hoverStatus"; label: "Status on hover"; description: "When nothing is playing, hovering shows CPU, memory, heat, battery and your next reminder." }
-          SettingToggle { visible: ui.buddy.evolves; key: "evolution"; label: "Evolve on her own"; description: "Now and then turn into an Eeveelution that fits the moment: heat, charging, time of day, breaks, pets." }
+          SettingToggle {
+            visible: ui.buddy.evolves
+            key: "evolution"
+            label: "Evolve on her own"
+            description: ui.buddy.species === "eevee"
+              ? "Now and then turn into an Eeveelution that fits the moment: heat, charging, time of day, breaks, pets."
+              : "Evolve for a while when something fits: Charmander when the CPU runs hot, Squirtle and Psyduck after a break, Bulbasaur in the morning, Pikachu while charging, Munchlax after lots of pets."
+          }
 
           SettingRow {
             visible: ui.buddy.evolves
@@ -309,9 +315,9 @@ Scope {
               width: Style.spacing.dropdownWidth
               showLabel: false
               fontFamily: ui.fontFamily
-              options: ui.formNames.map(function(f) { return { value: f, label: ui.buddy.pretty(f) } })
-              value: ui.buddy.form
-              onChanged: function(v) { ui.buddy.requestEvolve(v) }
+              options: [ui.buddy.species].concat(ui.buddy.speciesForms).map(function(f) { return { value: f, label: ui.buddy.pretty(f) } })
+              value: ui.buddy.buddyForm
+              onChanged: function(v) { ui.buddy.requestEvolve(v); value = Qt.binding(function() { return ui.buddy.buddyForm }) }
             }
           }
 
@@ -354,7 +360,7 @@ Scope {
               fontFamily: ui.fontFamily
               options: ui.modelOptions
               value: String(ui.s.model)
-              onChanged: function(v) { ui.set("model", v) }
+              onChanged: function(v) { ui.set("model", v); value = Qt.binding(function() { return String(ui.s.model) }) }
             }
           }
 
