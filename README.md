@@ -42,7 +42,7 @@ Everything Omarchy ships, plus:
 | | |
 |---|---|
 | Left click | Chat. Type a question, or `open spotify`, `launch github.com`, … |
-| Right click | Quick actions: screenshot, copy text from screen, colour picker, clipboard, emoji, attack, focus, settings, lock |
+| Right click | Quick actions: explain a screen area, explain the clipboard, fix the copied text, focus, settings |
 | Middle click | Pet her |
 | Hover | Music controls, or a status card |
 | Drag | Move her |
@@ -55,12 +55,56 @@ From scripts or keybindings:
 ```sh
 omarchy-shell rafa.eevee talk            # open the chat box
 omarchy-shell rafa.eevee settings
-omarchy-shell rafa.eevee action lock     # any quick action by name
+omarchy-shell rafa.eevee action area     # any quick action by name
 omarchy-shell rafa.eevee attack electric # or fire, water, grass, ice, psychic, dark, ghost, fairy, normal
 omarchy-shell rafa.eevee focusMode 50
 omarchy-shell rafa.eevee evolve charizard
 omarchy-shell rafa.eevee set species pikachu   # any setting, like the settings window
 ```
+
+## In the terminal
+
+Turn the shell hook on with `eevee-brain cmdhook on` (the settings window has a
+switch too). It costs nothing per command: a timestamp from `PS0`, no subshell
+and no `DEBUG` trap, so it layers with Starship.
+
+**She remembers how fast things ran.** Commands you run to time them — `./a.out`,
+`make`, `mvn`, `cargo`, `pytest` — get their best time kept per directory, and the
+next run says whether it beat it:
+
+```
+$ ./reduction
+sum=499500 (expected 499500)
+  ⏱ 2.09s  best yet — was 3.81s (-45%)
+
+$ eevee-brain times          # the best of each, for this folder
+~/Documents/AAD/P3
+  ./lock_and_unlock               650ms  best of 4
+  ./create_and_join               3.07s  best of 2
+```
+
+Runs under 200 ms are ignored (`benchmarkMs` moves the floor) and a run that
+failed is never recorded.
+
+**`why` explains the last failure.** It re-runs the command with its output
+captured and hands that to Claude, which can then read the source file the
+compiler is complaining about:
+
+```
+$ make broken
+broken.c:8:13: error: expected ';' before 'printf'
+$ why
+Line 8 of broken.c is missing a semicolon. Change `sum += i` to `sum += i;`.
+```
+
+Only commands that build, test or run something are repeated — anything with a
+redirection, a pipe, `sudo`, `rm`, `git push` or `docker` is explained from the
+command alone instead. The notification for a failed long command does the same
+thing when you click it.
+
+**Uncommitted work.** Every few hours she checks the repositories you work in
+and mentions one that has been sitting dirty for a couple of hours — never one
+you are still editing. Hidden trees, caches and `node_modules` are skipped.
 
 ## Settings
 
@@ -72,7 +116,8 @@ Settings are saved Omarchy's way, inline on the plugin's entry in `~/.config/oma
 
 - **Notifications:** she reads them from the session bus. While she's delivering them, Omarchy's Do Not Disturb is on, so its popups stay quiet and everything still goes to the notification history. Turning the setting off (or disabling the plugin) switches Do Not Disturb back off.
 - **What reaches Claude:** only what you ask her, plus a small snapshot of the desktop (load, memory, open apps). Screenshots and files are sent only when you ask about your screen or drop a file on her.
-- **Long commands:** the hook sees command lines only to name them in the notification; they never leave your machine.
+- **Long commands:** the hook sees command lines only to name them in the notification and to keep their run times locally (`~/.local/state/eevee/bench`); they never leave your machine.
+- **`why` and failure explanations:** these do send the command and the output of re-running it to Claude, because that is the question. Nothing is sent until you ask, by typing `why` or clicking the notification.
 
 ## How it works
 

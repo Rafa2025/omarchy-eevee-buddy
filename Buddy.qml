@@ -22,7 +22,8 @@ import qs.Commons
 //   left click    talk (type a question, Enter)
 //   middle click  pet
 //   hover         music controls when a player is open, else a quick status card
-//   right click   quick actions (screenshot, text, colour, clipboard, emoji, focus, settings, lock)
+//   right click   quick actions: a strip of icons (explain a screen area or
+//                 the clipboard, fix copied text, focus, settings)
 //   drop a file   she reads it and explains it (logs, PDFs, images, code)
 //   /attack       her signature move (also a quick action); events trigger
 //                 moves of the matching type, e.g. plugging in the charger
@@ -51,6 +52,7 @@ Item {
   readonly property var defaults: ({
     species: "eevee", shiny: "rare", screen: "follow", size: 3, wander: true,
     music: true, musicControls: true, hoverStatus: true, evolution: true, longCommandSeconds: 30, attacks: true, reduceMotion: false,
+    benchmarks: true, benchmarkMs: 200, explainFailures: true, gitNudge: true,
     notifications: true, noteSeconds: 5, holdWhileAway: true, hideWhenSharing: true,
     ai: true, model: "claude-haiku-4-5", screenshots: true,
     reactions: true, breakMinutes: 50, lateNight: true
@@ -276,6 +278,14 @@ Item {
   // track with previous / play-pause / next. The one playing wins, then
   // Spotify, then whichever player is there. She holds still meanwhile.
   // ---------------------------------------------------------------------
+  // The look every popup shares: a quiet card with a hairline border.
+  component Card: Rectangle {
+    radius: Math.max(8, Style.cornerRadius)
+    color: Util.alpha(Color.popups.background, 0.96)
+    border.width: 1
+    border.color: Util.alpha(Color.popups.text, 0.12)
+  }
+
   // A glyph button for the music controls.
   component MusicButton: Text {
     id: mb
@@ -334,25 +344,25 @@ Item {
   }
 
   // ---------------------------------------------------------------------
-  // Quick actions: right-click opens a ring of shortcuts above her head.
-  // It closes after an action, a click on her, or once the pointer has
-  // been away from it for a moment.
+  // Quick actions: right-click opens a small strip of icons above her head
+  // with the few things only she can do. Omarchy's own keys already cover
+  // screenshots, colour picking, emoji and launching, and left-click opens
+  // the chat, so anything that is just a sentence ("remind me in 10", "why
+  // is it slow?") belongs there rather than here. What stays is the work
+  // that needs the pointer or the clipboard under it. The strip closes
+  // after an action, a click on her, or once the pointer has been away
+  // from it for a moment.
   // ---------------------------------------------------------------------
   property bool actionsOpen: false
   readonly property var quickActions: [
-    { icon: "󰹑", label: "Screenshot", run: ["omarchy-capture-screenshot"] },
-    { icon: "󰊄", label: "Copy text from screen", run: ["omarchy-capture-text"] },
-    { icon: "󰈊", label: "Pick a colour", run: ["hyprpicker", "-a"] },
-    // The same clipboard the bar opens: the iamcheyan.clipboard plugin when
-    // installed (opens at the cursor, i.e. next to her), else Omarchy's own.
-    { icon: "󰅌", label: "Clipboard", run: ["bash", "-c", "omarchy-shell iamcheyan.clipboard open >/dev/null 2>&1 || omarchy-menu-clipboard"] },
-    { icon: "󰞅", label: "Emoji", run: ["omarchy-menu-emoji"] },
-    { icon: "󰔟", label: root.focusing ? "End focus" : "Focus for 25 min", fn: "focus" },
-    { icon: "󱐋", label: "Attack!", fn: "attack" },
-    { icon: "󰒓", label: "Settings", fn: "settings" },
-    { icon: "󰌾", label: "Lock screen", run: ["omarchy-system-lock"] }
+    { icon: "󰆞", label: "Explain an area", fn: "look", ai: true },
+    { icon: "󰅌", label: "Explain clipboard", fn: "clip", ai: true },
+    { icon: "󰓆", label: "Fix clipboard text", fn: "fix", ai: true },
+    { icon: "󰔟", label: root.focusing ? "End focus" : "Focus 25 min", fn: "focus" },
+    { icon: "󰒓", label: "Settings", fn: "settings" }
   ]
-  // The ring and the chat box replace each other: only one is ever open.
+  readonly property var visibleActions: root.quickActions.filter(function(a) { return !a.ai || root.settings.ai })
+  // The menu and the chat box replace each other: only one is ever open.
   function toggleActions() {
     root.actionsOpen = !root.actionsOpen
     if (root.actionsOpen) {
@@ -364,22 +374,23 @@ Item {
     root.actionsOpen = false
     if (a.fn === "focus") { if (root.focusing) root.endFocus(); else root.startFocus(25); root.react("happy") }
     else if (a.fn === "settings") root.openSettings()
-    else if (a.fn === "attack") attackDelay.restart()
-    else if (a.run) { actionLaunch.pending = a.run; actionLaunch.restart() }
+    else if (a.fn === "clip") root.runBrain(["clip", "explain"])
+    else if (a.fn === "fix") root.runBrain(["clip", "fix"])
+    else if (a.fn === "look") lookDelay.restart()
   }
-  // Commands start just after the ring has gone and the click is over, so a
-  // screenshot doesn't catch the ring and the lock screen gets a clean grab.
-  Timer { id: attackDelay; interval: 150; onTriggered: root.attack("") }
-  Timer {
-    id: actionLaunch
-    property var pending: null
-    interval: 200
-    onTriggered: if (pending) { Quickshell.execDetached(pending); pending = null }
+  // The area picker starts once the menu has gone; the capture happens
+  // before she starts thinking, so her bubble isn't in the picture.
+  Timer { id: lookDelay; interval: 200; onTriggered: if (!lookProc.running) lookProc.running = true }
+  Process {
+    id: lookProc
+    readonly property string file: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/eevee/look.png"
+    command: ["bash", "-c", "mkdir -p \"${1%/*}\" && g=$(slurp) && grim -g \"$g\" \"$1\"", "_", file]
+    onExited: function(code) { if (code === 0) root.runBrain(["look", lookProc.file]) }
   }
   Timer {
     id: actionsIdle
     interval: 1800
-    onTriggered: if (root.actionsOpen) { if (actionRingHover.hovered || dragArea.containsMouse) restart(); else root.actionsOpen = false }
+    onTriggered: if (root.actionsOpen) { if (actionMenuHover.hovered || dragArea.containsMouse) restart(); else root.actionsOpen = false }
   }
 
   // ---------------------------------------------------------------------
@@ -594,21 +605,24 @@ Item {
   property string evolveFrom: ""
   property string evolveTarget: ""
 
-  function evolveTo(target, message) {
+  // `asked` marks an evolution you typed or triggered yourself (/evolve,
+  // /devolve, the IPC). Reduce motion silences the evolutions she decides on
+  // by herself, but not one you just asked to see.
+  function evolveTo(target, message, asked) {
     if (!root.forms[target] || target === root.form) return
     if (root.evolving || root.chatOpen || root.thinking) {
-      if (!root.evolving) root.pendingEvolution = { target: target, message: message }
+      if (!root.evolving) root.pendingEvolution = { target: target, message: message, asked: asked === true }
       return
     }
     var from = root.shownForm
     root.form = target
     // Only animate a real change of what's on screen.
-    if (root.buddyForm !== from) root.playEvolution(from, root.buddyForm)
+    if (root.buddyForm !== from) root.playEvolution(from, root.buddyForm, asked === true)
   }
 
   // The evolution sequence (white silhouette, flicker, flash).
-  function playEvolution(from, to) {
-    if (root.settings.reduceMotion) return // shownForm simply follows
+  function playEvolution(from, to, asked) {
+    if (root.settings.reduceMotion && !asked) return // shownForm simply follows
     root.flickerForm = from
     root.evolveFrom = from
     root.evolveTarget = to
@@ -646,7 +660,6 @@ Item {
       script: {
         root.evolving = false
         root.react("happy")
-        if (!root.settings.reduceMotion) sparkleBurst.restart()
       }
     }
   }
@@ -655,7 +668,7 @@ Item {
     id: evolveDelay
     property var pending: null
     interval: 800
-    onTriggered: if (pending) { root.evolveTo(pending.target, pending.message); pending = null }
+    onTriggered: if (pending) { root.evolveTo(pending.target, pending.message, pending.asked); pending = null }
   }
 
   function requestEvolve(target) {
@@ -670,7 +683,8 @@ Item {
       waitForEnd: true
       onStreamFinished: {
         var lines = String(text || "").trim().split("\n")
-        if (lines.length >= 2) root.evolveTo(lines[lines.length - 1].trim(), lines[0])
+        // Everything through requestEvolve is something you asked for.
+        if (lines.length >= 2) root.evolveTo(lines[lines.length - 1].trim(), lines[0], true)
       }
     }
     stderr: StdioCollector {
@@ -953,10 +967,25 @@ Item {
     behaviourTimer.restartIn(4000)
   }
 
+  // A pet is something you did with your own hand, so she always answers it
+  // with a real animation. Reduce motion is there to stop her fidgeting on
+  // her own; it should not make her ignore you. The cycle never repeats an
+  // animation twice in a row, because play() skips a looping animation that
+  // is already running -- so the tenth pet still reads as a reaction.
+  readonly property var petAnims: ["Hop", "Pose", "Hop", "Nod", "Hop", "LookUp"]
+  property int petCount: 0
+
   function pet() {
-    if (root.attackFor("pet") !== "") root.attack("fairy")
-    else root.react("happy")
-    if (!root.settings.reduceMotion) heartBurst.restart()
+    if (root.evolving) return
+    // A Fairy-type flourish when her type calls for one; attack() bows out
+    // under reduce motion, so only take that branch when it will show.
+    if (!root.settings.reduceMotion && root.attackFor("pet") !== "") {
+      root.attack("fairy")
+    } else if (!root.attacking) {
+      root.walking = false
+      root.play(root.petAnims[root.petCount++ % root.petAnims.length])
+      if (!root.pinned) behaviourTimer.restartIn(4000)
+    }
     // Enough affection evolves Eevee into Sylveon.
     Quickshell.execDetached(["bash", root.brain, "pet"])
   }
@@ -1120,11 +1149,11 @@ Item {
     // Attack with a type ("electric", "fire", …) or, empty, her own.
     function attack(type: string): void { root.attack(type) }
     function event(name: string): void { root.onEvent(name, "") }
-    // Run one quick action by (part of) its name, e.g. "screenshot", "lock".
+    // Run one quick action by (part of) its name, e.g. "area", "fix".
     function action(name: string): string {
       var q = String(name || "").toLowerCase()
-      for (var i = 0; i < root.quickActions.length; i++)
-        if (q !== "" && root.quickActions[i].label.toLowerCase().indexOf(q) !== -1) { root.runAction(root.quickActions[i]); return root.quickActions[i].label }
+      for (var i = 0; i < root.visibleActions.length; i++)
+        if (q !== "" && root.visibleActions[i].label.toLowerCase().indexOf(q) !== -1) { root.runAction(root.visibleActions[i]); return root.visibleActions[i].label }
       return "unknown"
     }
     function focusMode(minutes: string): void { if (/^(off|stop|end)$/i.test(minutes)) root.endFocus(); else root.startFocus(minutes) }
@@ -1167,7 +1196,7 @@ Item {
       Region { item: bubble.visible ? bubble : null }
       Region { item: chatBox.visible ? chatBox : null }
       Region { item: musicBar.visible ? musicBar : null }
-      Region { item: actionRing.visible ? actionRing : null }
+      Region { item: actionMenu.visible ? actionMenu : null }
     }
 
     // Ground line: Eevee's feet rest here.
@@ -1261,18 +1290,14 @@ Item {
     }
 
     // Music controls on hover.
-    Rectangle {
+    Card {
       id: musicBar
       visible: root.controlsVisible
       readonly property var p: root.player
-      width: (root.showMusic ? musicRow.implicitWidth : statusCol.implicitWidth) + 20
-      height: (root.showMusic ? musicRow.implicitHeight : statusCol.implicitHeight) + 12
+      width: (root.showMusic ? musicRow.implicitWidth : statusCol.implicitWidth) + 24
+      height: (root.showMusic ? musicRow.implicitHeight : statusCol.implicitHeight) + 16
       x: Math.max(8, Math.min(panel.width - width - 8, root.posX - width / 2))
-      y: hitBox.y - height - 8
-      radius: Math.max(6, Style.cornerRadius)
-      color: Util.alpha(Color.popups.background, 0.97)
-      border.width: 1
-      border.color: Util.alpha(Color.accent, 0.7)
+      y: hitBox.y - height - 10
       HoverHandler { id: controlsHover }
 
       Column {
@@ -1364,60 +1389,52 @@ Item {
       }
     }
 
-    // Quick-actions ring.
-    Item {
-      id: actionRing
+    // Quick actions: one row of icons, nothing else. Five glyphs the hand
+    // learns in a day; a label under them only made the strip resize as
+    // the pointer crossed it.
+    Card {
+      id: actionMenu
       visible: root.actionsOpen
-      readonly property real radius: 118
-      width: radius * 2 + 48
-      height: radius + 64
-      x: Math.max(4, Math.min(panel.width - width - 4, root.posX - width / 2))
-      y: hitBox.y - height + 18
-      HoverHandler { id: actionRingHover }
-      property string hint: ""
+      readonly property int cell: 30
+      color: Util.alpha(Color.popups.background, 0.82)
+      border.color: Util.alpha(Color.popups.text, 0.08)
+      width: actionRow.implicitWidth + 12
+      height: cell + 12
+      x: Math.max(8, Math.min(panel.width - width - 8, root.posX - width / 2))
+      y: hitBox.y - height - 8
+      HoverHandler { id: actionMenuHover }
 
-      Repeater {
-        model: root.quickActions
-        delegate: Rectangle {
-          required property var modelData
-          required property int index
-          readonly property real angle: Math.PI - index * Math.PI / (root.quickActions.length - 1)
-          width: 42; height: 42; radius: 21
-          x: actionRing.width / 2 + actionRing.radius * Math.cos(angle) - width / 2
-          y: actionRing.height - 30 - actionRing.radius * Math.sin(angle) - height / 2
-          color: actionMouse.containsMouse ? Color.accent : Util.alpha(Color.popups.background, 0.97)
-          border.width: 1
-          border.color: Util.alpha(Color.accent, 0.7)
-          Text {
-            anchors.centerIn: parent
-            text: modelData.icon
-            textFormat: Text.PlainText
-            color: actionMouse.containsMouse ? Color.popups.background : Color.popups.text
-            font.family: Style.font.family
-            font.pixelSize: 19
-          }
-          MouseArea {
-            id: actionMouse
-            anchors.fill: parent
-            hoverEnabled: true
-            cursorShape: Qt.PointingHandCursor
-            onContainsMouseChanged: if (containsMouse) actionRing.hint = modelData.label; else if (actionRing.hint === modelData.label) actionRing.hint = ""
-            onClicked: root.runAction(modelData)
+      Row {
+        id: actionRow
+        anchors.centerIn: parent
+        spacing: 0
+
+        Repeater {
+          model: root.visibleActions
+          delegate: Rectangle {
+            required property var modelData
+            width: actionMenu.cell
+            height: actionMenu.cell
+            radius: height / 2
+            color: actionMouse.containsMouse ? Util.alpha(Color.accent, 0.2) : "transparent"
+
+            Text {
+              anchors.centerIn: parent
+              textFormat: Text.PlainText
+              text: modelData.icon
+              color: actionMouse.containsMouse ? Color.accent : Util.alpha(Color.popups.text, 0.8)
+              font.family: Style.font.family
+              font.pixelSize: 16
+            }
+            MouseArea {
+              id: actionMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.runAction(modelData)
+            }
           }
         }
-      }
-
-      Text {
-        anchors.horizontalCenter: parent.horizontalCenter
-        anchors.bottom: parent.bottom
-        anchors.bottomMargin: 34
-        text: actionRing.hint
-        textFormat: Text.PlainText
-        color: Color.popups.text
-        style: Text.Outline
-        styleColor: Util.alpha(Color.popups.background, 0.9)
-        font.family: Style.font.family
-        font.pixelSize: Style.font.caption
       }
     }
 
@@ -1589,24 +1606,6 @@ Item {
       }
     }
 
-    // Hearts on pet.
-    Text {
-      id: hearts
-      text: "♥ ♥"
-      color: Color.urgent
-      font.pixelSize: 18
-      x: root.posX - width / 2
-      y: hitBox.y - 10
-      opacity: 0
-      SequentialAnimation {
-        id: heartBurst
-        ParallelAnimation {
-          NumberAnimation { target: hearts; property: "opacity"; from: 1; to: 0; duration: 1200 }
-          NumberAnimation { target: hearts; property: "y"; from: hitBox.y - 4; to: hitBox.y - 50; duration: 1200; easing.type: Easing.OutQuad }
-        }
-      }
-    }
-
     // Evolution flash.
     Rectangle {
       id: flash
@@ -1623,36 +1622,22 @@ Item {
       }
     }
 
-    Text {
-      id: sparkles
-      text: "✦  ✧  ✦"
-      color: Color.accent
-      font.pixelSize: 20
-      x: root.posX - width / 2
-      y: hitBox.y - 16
-      opacity: 0
-      ParallelAnimation {
-        id: sparkleBurst
-        NumberAnimation { target: sparkles; property: "opacity"; from: 1; to: 0; duration: 1600 }
-        NumberAnimation { target: sparkles; property: "y"; from: hitBox.y - 6; to: hitBox.y - 70; duration: 1600; easing.type: Easing.OutQuad }
-      }
-    }
-
-    // Speech bubble.
-    Rectangle {
+    // Speech bubble. Deliberately slight: a translucent slip of text that
+    // sits over the wallpaper rather than a panel that covers it. No tail,
+    // no frame -- she is right underneath it, so nothing has to point.
+    Card {
       id: bubble
       visible: root.speechVisible || root.thinking
-      readonly property int maxW: 400
-      readonly property int pad: 12
-      width: Math.min(maxW, Math.max(bubbleText.implicitWidth, bubbleTitle.visible ? bubbleTitle.implicitWidth : 0,
-        copyRow.visible ? copyLabel.implicitWidth : 0) + pad * 2)
-      height: Math.min(300, bubbleCol.implicitHeight + pad * 2)
-      x: panel.popupX
-      y: hitBox.y - height - 10
+      readonly property int maxW: 290
+      readonly property int pad: 9
       radius: Math.max(6, Style.cornerRadius)
-      color: Util.alpha(Color.popups.background, 0.97)
-      border.width: 1
-      border.color: Util.alpha(Color.accent, 0.7)
+      color: Util.alpha(Color.popups.background, 0.78)
+      border.color: Util.alpha(Color.popups.text, 0.07)
+      width: Math.min(maxW, Math.max(bubbleText.implicitWidth, bubbleTitle.visible ? bubbleTitle.implicitWidth : 0,
+        copyRow.visible ? copyRow.implicitWidth : 0) + pad * 2)
+      height: Math.min(200, bubbleCol.implicitHeight + pad * 2)
+      x: panel.popupX
+      y: hitBox.y - height - 8
 
       HoverHandler { id: bubbleHover }
 
@@ -1667,7 +1652,7 @@ Item {
         Column {
           id: bubbleCol
           width: bubbleFlick.width
-          spacing: 8
+          spacing: 3
 
           Text {
             id: bubbleTitle
@@ -1676,10 +1661,9 @@ Item {
             elide: Text.ElideRight
             textFormat: Text.PlainText
             text: root.speechTitle
-            color: Color.accent
+            color: Util.alpha(Color.popups.text, 0.45)
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
-            font.bold: true
           }
 
           Text {
@@ -1688,33 +1672,39 @@ Item {
             wrapMode: Text.Wrap
             textFormat: Text.PlainText
             text: root.thinking ? "Hmm" + ".".repeat(thinkDots.n) : root.speechText
-            color: Color.popups.text
+            color: Util.alpha(Color.popups.text, 0.92)
             font.family: Style.font.family
-            font.pixelSize: Style.font.body
-            lineHeight: 1.1
+            font.pixelSize: Style.font.bodySmall
+            lineHeight: 1.15
           }
 
-          Row {
+          // Copy the command in the answer: a small pill under the text.
+          Rectangle {
             id: copyRow
             visible: !root.thinking && root.speechCommand !== ""
-            spacing: 6
+            implicitWidth: Math.min(copyLabel.implicitWidth + 12, bubble.maxW - bubble.pad * 2)
+            width: implicitWidth
+            height: copyLabel.implicitHeight + 5
+            radius: height / 2
+            color: copyHover.hovered ? Util.alpha(Color.accent, 0.16) : Util.alpha(Color.popups.text, 0.05)
+            HoverHandler { id: copyHover; cursorShape: Qt.PointingHandCursor }
+            TapHandler {
+              onTapped: {
+                Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(root.speechCommand) + " | wl-copy"])
+                copied.restart()
+              }
+            }
+            Timer { id: copied; interval: 1500 }
             Text {
               id: copyLabel
-              textFormat: Text.PlainText
-              text: (copied.running ? "Copied ✓  " : "⧉ Copy  ") + root.speechCommand
+              anchors.centerIn: parent
+              width: Math.min(implicitWidth, parent.width - 12)
               elide: Text.ElideRight
-              width: Math.min(implicitWidth, bubble.maxW - bubble.pad * 2)
-              color: copyHover.hovered ? Color.accent : Util.alpha(Color.popups.text, 0.7)
+              textFormat: Text.PlainText
+              text: (copied.running ? "󰄬 Copied" : "󰆏 ") + (copied.running ? "" : root.speechCommand)
+              color: copyHover.hovered || copied.running ? Color.accent : Util.alpha(Color.popups.text, 0.75)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
-              HoverHandler { id: copyHover; cursorShape: Qt.PointingHandCursor }
-              TapHandler {
-                onTapped: {
-                  Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(root.speechCommand) + " | wl-copy"])
-                  copied.restart()
-                }
-              }
-              Timer { id: copied; interval: 1500 }
             }
           }
         }
@@ -1742,40 +1732,56 @@ Item {
     }
 
     // Chat box.
-    Rectangle {
+    Card {
       id: chatBox
       visible: root.chatOpen
-      width: 380
-      height: chatInput.implicitHeight + 22
-      x: panel.popupX
-      y: hitBox.y - height - 10
+      readonly property int pad: 8
+      // Just the prompt and room for the caret; it widens as you type and
+      // stops at the bubble's width. No placeholder -- the caret says it.
+      width: Math.min(bubble.maxW, Math.max(96,
+        chatPrompt.width + chatMetrics.width + pad * 2 + 10))
+      height: Math.max(26, chatInput.implicitHeight + pad)
+      // Centred on her, not on panel.popupX: that reserves the bubble's
+      // width, which would leave this much narrower box sitting to the left
+      // of it. Clamped so it stays on screen at the edges.
+      x: Math.max(8, Math.min(panel.width - width - 8, root.posX - width / 2))
+      y: hitBox.y - height - 8
       radius: Math.max(6, Style.cornerRadius)
-      color: Util.alpha(Color.popups.background, 0.97)
-      border.width: 1
-      border.color: Color.accent
+      color: Util.alpha(Color.popups.background, 0.78)
+      border.color: Util.alpha(Color.accent, 0.3)
+
+      // Measured off to the side, so the width never depends on the width.
+      TextMetrics {
+        id: chatMetrics
+        font: chatInput.font
+        text: chatInput.text
+      }
+
+      Text {
+        id: chatPrompt
+        x: chatBox.pad
+        anchors.verticalCenter: parent.verticalCenter
+        textFormat: Text.PlainText
+        text: "›"
+        color: Color.accent
+        font.family: Style.font.family
+        font.pixelSize: Style.font.bodySmall + 1
+      }
 
       TextInput {
         id: chatInput
         anchors.fill: parent
-        anchors.leftMargin: 12
-        anchors.rightMargin: 12
+        anchors.leftMargin: chatPrompt.x + chatPrompt.width + 5
+        anchors.rightMargin: chatBox.pad
         verticalAlignment: TextInput.AlignVCenter
         clip: true
         selectByMouse: true
         color: Color.popups.text
+        selectionColor: Util.alpha(Color.accent, 0.35)
         font.family: Style.font.family
-        font.pixelSize: Style.font.body
+        font.pixelSize: Style.font.bodySmall
         onAccepted: root.ask(text)
         Keys.onEscapePressed: root.closeChat()
-
-        Text {
-          anchors.verticalCenter: parent.verticalCenter
-          visible: chatInput.text === ""
-          textFormat: Text.PlainText
-          text: "Ask or \"open <app>\"… (Esc closes)"
-          color: Util.alpha(Color.popups.text, 0.45)
-          font: chatInput.font
-        }
       }
     }
   }

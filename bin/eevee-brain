@@ -19,6 +19,12 @@
 #   eevee-brain cmd-done <secs> <status> <shell pid> <command>
 #                                (from shell/eevee-hook.bash) notify when a
 #                                long command finishes in a window you left
+#   eevee-brain bench <us> <status> <dir> <command>
+#                                (from the hook) keep the time a run took and
+#                                report how it compares with the best so far
+#   eevee-brain times [dir]      the best time kept for each command there
+#   eevee-brain explain-fail <dir> <command>
+#                                re-run a failed build and explain what broke
 #   eevee-brain cmdhook [on|off|status]  install that hook in ~/.bashrc
 #
 # Settings live inline on the plugin's entry in ~/.config/omarchy/shell.json
@@ -382,6 +388,70 @@ say() { printf '%s\t%s\n' "$1" "$2"; }
 # Omarchy's popups when she isn't delivering them) and land in the history.
 remind() { notify-send -a Eevee -u low "$1" "$2" >/dev/null 2>&1 & }
 
+# ---------------------------------------------------------------------------
+# Work you have not committed. Dotfiles sync themselves; a course repository
+# does not, and the cost of noticing late is a lost afternoon. Once every
+# few hours she looks at the repositories you actually work in and mentions
+# one that has been sitting dirty for a while -- only when you have stopped
+# touching it, so it never interrupts the edit you are in the middle of.
+#
+# The repository list is found once a day and cached; the check itself is
+# `git status --porcelain` on a handful of paths, behind a long cooldown.
+# ---------------------------------------------------------------------------
+GIT_ROOTS_CACHE="$RUN/git-roots"
+GIT_DIRTY_AGE=7200   # dirty for 2 h before it is worth a word
+GIT_SCAN_EVERY=14400 # and at most one mention every 4 h
+
+git_roots() {
+  if [[ ! -s $GIT_ROOTS_CACHE ]] || (( EPOCHSECONDS - $(stat -c %Y "$GIT_ROOTS_CACHE" 2>/dev/null || echo 0) > 86400 )); then
+    local search=() d
+    for d in "$HOME/Documents" "$HOME/Projects" "$HOME/Work" "$HOME/src" "$HOME/code"; do
+      [[ -d $d ]] && search+=("$d")
+    done
+    (( ${#search[@]} )) || { : >"$GIT_ROOTS_CACHE"; return; }
+    # Skip hidden trees (caches, a synced copy of $HOME, chezmoi's own
+    # checkout -- that one already syncs itself) and vendored code.
+    find "${search[@]}" \
+      \( -name '.*' -o -name node_modules -o -name vendor -o -name target \) \
+        -prune -type d ! -name .git -o \
+      -maxdepth 4 -type d -name .git -printf '%h\n' 2>/dev/null \
+      | head -40 >"$GIT_ROOTS_CACHE"
+  fi
+}
+
+# The newest change in a repo's working tree, as an epoch second.
+git_touched() {
+  local repo=$1 newest=0 t f
+  while IFS= read -r f; do
+    [[ -e $repo/$f ]] || continue
+    t=$(stat -c %Y "$repo/$f" 2>/dev/null) || continue
+    (( t > newest )) && newest=$t
+  done < <(git -C "$repo" status --porcelain 2>/dev/null | cut -c4- | head -20)
+  echo "$newest"
+}
+
+check_uncommitted() {
+  enabled gitNudge true || return 0
+  cooldown gitnudge "$GIT_SCAN_EVERY" || return 0
+  git_roots
+  [[ -s $GIT_ROOTS_CACHE ]] || return 0
+
+  local repo n touched age name
+  while IFS= read -r repo; do
+    [[ -d $repo/.git ]] || continue
+    n=$(git -C "$repo" status --porcelain 2>/dev/null | wc -l)
+    (( n > 0 )) || continue
+    touched=$(git_touched "$repo")
+    (( touched > 0 )) || continue
+    age=$(( EPOCHSECONDS - touched ))
+    (( age >= GIT_DIRTY_AGE )) || continue   # still warm: you are working in it
+    name=${repo##*/}
+    say think "$name has $n uncommitted file$( (( n == 1 )) || echo s ), untouched for $(fmt_duration "$age"). Worth a commit?"
+    return 0
+  done <"$GIT_ROOTS_CACHE"
+  return 0
+}
+
 # sense <active 0|1> <work streak, minutes> <back from a break 0|1>
 # The sprite tracks activity with Wayland idle monitors and passes it in.
 cmd_sense() {
@@ -437,6 +507,8 @@ cmd_sense() {
   [[ $FAILED == "$known" ]] || printf '%s\n' "$FAILED" >"$STATE/failed_known"
   [[ -n $new_failed ]] && say spooky "A service just failed: ${new_failed% }."
 
+  check_uncommitted
+
   local brk=${CFG[breakMinutes]:-50}
   if (( brk > 0 && STREAK_MIN >= brk && ACTIVE )) && cooldown break $(( brk * 60 )); then
     say calm ""
@@ -474,25 +546,27 @@ focus_existing() { # focus_existing <pattern>... -> 0 if a window was focused
 
 detach() { setsid -f "$@" >/dev/null 2>&1 </dev/null; }
 
+# Launching says nothing on success: the window appearing is the answer,
+# and a bubble reading "Opening Chrome!" is just one more thing to dismiss.
+# Only "I couldn't find it" is worth words.
 cmd_launch() {
-  local q="$*" url best id name wm stem others
+  local q="$*" url best id wm stem others
   q="${q#"${q%%[![:space:]]*}"}"; q="${q%"${q##*[![:space:]]}"}"
   [[ -n $q ]] || { echo "Launch what? Tell me an app name."; return 3; }
 
   if [[ $q =~ ^https?:// || $q =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(/[^[:space:]]*)?$ ]]; then
     url=$q; [[ $url == http* ]] || url="https://$url"
     detach omarchy-launch-browser "$url"
-    echo "Opening $url in your browser!"
     return 0
   fi
 
   case "${q,,}" in
     terminal|term|shell|console|a\ terminal)
-      detach omarchy-launch-terminal; echo "Here's a terminal!"; return 0 ;;
+      detach omarchy-launch-terminal; return 0 ;;
     browser|web|internet|web\ browser|the\ browser|navegador)
-      detach omarchy-launch-browser; echo "Opening your browser!"; return 0 ;;
+      detach omarchy-launch-browser; return 0 ;;
     files|file\ manager|explorer|ficheiros|arquivos)
-      focus_existing org.gnome.nautilus || detach omarchy-launch-nautilus; echo "Opening Files!"; return 0 ;;
+      focus_existing org.gnome.nautilus || detach omarchy-launch-nautilus; return 0 ;;
   esac
 
   best=$(python3 "$APPS" find "$q" | head -1)
@@ -501,15 +575,13 @@ cmd_launch() {
     echo "I couldn't find an app called '$q'.${others:+ Did you mean: $others?}"
     return 3
   fi
-  id=$(jq -r .id <<<"$best"); name=$(jq -r .name <<<"$best"); wm=$(jq -r .wmclass <<<"$best")
+  id=$(jq -r .id <<<"$best"); wm=$(jq -r .wmclass <<<"$best")
   stem=${id%.desktop}
 
   if focus_existing "$wm" "$stem" "${stem##*.}" "$(jq -r '.exec | split(" ")[0] | split("/")[-1]' <<<"$best")"; then
-    echo "$name is already open, so I brought it to the front!"
     return 0
   fi
   detach uwsm-app -- "$id"
-  echo "Opening $name! Vee!"
 }
 
 cmd_apps() { python3 "$APPS" list "$@"; }
@@ -602,7 +674,18 @@ fmt_duration() {
   printf '%ds' "$s"
 }
 
+# cmd_done [--us <microseconds>] [--dir <cwd>] <secs> <status> <shell pid> <command...>
+# The flags are what the current hook sends; the bare positional form is kept
+# so a shell started before this version still reports correctly.
 cmd_done() {
+  local us=0 dir=""
+  while [[ ${1-} == --* ]]; do
+    case $1 in
+      --us) us=${2:-0}; shift 2 ;;
+      --dir) dir=${2:-}; shift 2 ;;
+      *) shift ;;
+    esac
+  done
   local secs=$1 status=$2 spid=$3; shift 3
   local cmd="$*" min
   min=$(setting longCommandSeconds 30)
@@ -634,11 +717,177 @@ cmd_done() {
   fi
   local args=(-a Terminal -u "$urgency")
   [[ -n $class ]] && args+=(-h "string:desktop-entry:$class")
-  if [[ -n $addr ]]; then
+  # Clicking a failure asks her why; clicking a success just takes you back
+  # to the terminal, because there is nothing to explain.
+  if (( status != 0 )) && enabled explainFailures true; then
+    args+=(-h "string:omarchy-exec-argv:$(jq -cn --arg s "$SELF" --arg d "${dir:-$HOME}" --arg c "$cmd" \
+      '["bash",$s,"explain-fail",$d,$c]')")
+  elif [[ -n $addr ]]; then
     args+=(-h "string:omarchy-exec-argv:$(jq -cn --arg a "$addr" \
       '["bash","-c","hyprctl dispatch \"hl.dsp.focus({ window = \\\"address:\($a)\\\" })\" >/dev/null 2>&1 || hyprctl dispatch focuswindow address:\($a)"]')")
   fi
-  notify-send "${args[@]}" "$title" "Took $(fmt_duration "$secs")"
+  local took; took="Took $(fmt_duration "$secs")"
+  (( us > 0 )) && took="Took $(fmt_us "$us")"
+  (( status == 0 )) || took+=" · click to ask me why"
+  notify-send "${args[@]}" "$title" "$took"
+}
+
+# ---------------------------------------------------------------------------
+# "Why did that fail?" A failed build or test says almost nothing in the
+# notification, so clicking it (or typing `why` in the shell) runs the same
+# command again with its output captured and hands that to Claude, which can
+# then read the source file the compiler is complaining about.
+#
+# Only commands that build, test or run something are repeated. Re-running a
+# compile is free; re-running the rest of your shell history is not, so
+# anything with a redirection, a pipe into something, sudo, rm, git push and
+# friends is refused and explained from the command alone.
+# ---------------------------------------------------------------------------
+fail_safe_to_repeat() { # fail_safe_to_repeat <command>
+  local cmd=$1
+  # No side effects we cannot see: no redirection, no chaining into the
+  # unknown, no privilege, no network writes.
+  case $cmd in
+    *\>*|*\<*|*\|*|*\;*|*\&*|*\`*|*\$\(*) return 1 ;;
+    sudo*|doas*|rm\ *|mv\ *|dd\ *|mkfs*|chmod\ *|chown\ *) return 1 ;;
+    git\ push*|git\ pull*|git\ clone*|git\ reset*|git\ checkout*|npm\ publish*|docker\ *) return 1 ;;
+  esac
+  case $cmd in
+    ./*|make|make\ *|cc\ *|gcc\ *|g++\ *|clang\ *|clang++\ *|javac\ *|java\ *) return 0 ;;
+    mvn\ *|gradle*|cargo\ *|go\ *|rustc\ *|zig\ *|gfortran\ *|cmake*|ctest*) return 0 ;;
+    npm\ *|pnpm\ *|yarn\ *|pytest*|python\ *|python3\ *|node\ *) return 0 ;;
+  esac
+  return 1
+}
+
+# explain-fail <dir> <command...>: capture, then ask. Called by the failure
+# notification and by the `why` shell function.
+PLUGIN_IPC="rafa.eevee"
+
+cmd_explain_fail() {
+  local dir=$1; shift
+  local cmd="$*" out="$RUN/fail.txt" captured=0
+  [[ -n $cmd ]] || { echo "Nothing to explain."; return 0; }
+  [[ -d $dir ]] || dir=$HOME
+
+  if fail_safe_to_repeat "$cmd"; then
+    { printf '$ %s\n' "$cmd"
+      cd "$dir" 2>/dev/null && timeout 120 bash -c "$cmd" 2>&1 | head -c 20000
+    } >"$out" 2>&1
+    captured=1
+  fi
+
+  local q
+  if (( captured )); then
+    q="The command  $cmd  failed in $dir. I ran it again and saved everything it printed to $out — read that file, then tell me what went wrong and the fix. If it names a source file and line, read that too. If it crashed with no message, say what usually causes that for this kind of program."
+  else
+    q="The command  $cmd  failed in $dir. I can't safely run it again, so work from the command itself and the files in that directory: tell me the most likely reason it failed and what to try."
+  fi
+
+  # From a notification click there is no terminal to print to, so hand it
+  # to the sprite; she shows the thinking animation and the answer. When
+  # there is a terminal (the `why` function), answer there as well.
+  if [[ -t 1 ]]; then
+    cmd_ask "$q"
+  else
+    # Not -q: that returns success even when the shell isn't there, which
+    # would swallow the answer instead of falling back to stdout.
+    omarchy-shell "$PLUGIN_IPC" ask "$q" >/dev/null 2>&1 || cmd_ask "$q"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Benchmark memory. Commands that are really "run this and see how fast it
+# is" -- ./a.out, make, mvn, cargo -- get their time kept per directory, so
+# the next run can say whether it got faster. The AAD makefiles ask you to
+# run each program three times and keep the best; this is that, without the
+# notebook. Times are microseconds; a run that failed is never recorded.
+# ---------------------------------------------------------------------------
+BENCH_DB="$STATE/bench"
+
+# bench_shape <command>: 0 if this is a command worth timing. The hook asks
+# the same question in-line so it can stay silent for everything else.
+bench_shape() {
+  case "$1" in
+    ./*) return 0 ;;
+    make|make\ *|mvn|mvn\ *|cargo\ *|go\ run*|go\ test*|gradle*|ctest*|cmake\ --build*) return 0 ;;
+    npm\ run*|npm\ test*|pnpm\ *|yarn\ *|pytest*|python\ *.py*|python3\ *.py*) return 0 ;;
+    cc\ *|gcc\ *|g++\ *|clang\ *|clang++\ *|javac\ *|java\ *|rustc\ *|zig\ *|gfortran\ *) return 0 ;;
+  esac
+  return 1
+}
+
+# fmt_ms <microseconds> -> "2.09s" / "840ms" / "1m 04s"
+fmt_us() {
+  local us=$1
+  (( us >= 60000000 )) && { printf '%dm %02ds' $((us / 60000000)) $((us % 60000000 / 1000000)); return; }
+  (( us >= 1000000 )) && { printf '%d.%02ds' $((us / 1000000)) $((us % 1000000 / 10000)); return; }
+  printf '%dms' $((us / 1000))
+}
+
+# One line per run: <dir>\t<command>\t<best us>\t<runs>\t<last us>\t<epoch>
+cmd_bench() { # cmd_bench <microseconds> <status> <dir> <command...>
+  local us=$1 status=$2 dir=$3; shift 3
+  local cmd="$*"
+  enabled benchmarks true || return 0
+  [[ -n $cmd ]] || return 0
+  (( status == 0 )) || return 0          # a crash is not a measurement
+  # Below the floor the measurement is mostly process start-up, and every
+  # small compile would print a line. 200 ms by default; benchmarkMs moves it.
+  local floor; floor=$(setting benchmarkMs 200)
+  (( us >= floor * 1000 )) || return 0
+
+  local line d c best runs last _t kept="" found=0
+  [[ -f $BENCH_DB ]] || : >"$BENCH_DB"
+  while IFS=$'\t' read -r d c best runs last _t; do
+    if [[ $d == "$dir" && $c == "$cmd" ]]; then
+      found=1
+      (( us < best )) && best=$us
+      runs=$(( runs + 1 ))
+      printf -v line '%s\t%s\t%s\t%s\t%s\t%s' "$dir" "$cmd" "$best" "$runs" "$us" "$EPOCHSECONDS"
+      BENCH_BEST=$best BENCH_RUNS=$runs BENCH_PREV=$last
+    else
+      printf -v line '%s\t%s\t%s\t%s\t%s\t%s' "$d" "$c" "$best" "$runs" "$last" "$_t"
+    fi
+    kept+="$line"$'\n'
+  done <"$BENCH_DB" 2>/dev/null
+
+  if (( ! found )); then
+    BENCH_BEST=$us BENCH_RUNS=1 BENCH_PREV=0
+    kept+="$dir"$'\t'"$cmd"$'\t'"$us"$'\t'1$'\t'"$us"$'\t'"$EPOCHSECONDS"$'\n'
+  fi
+  printf '%s' "$kept" >"$BENCH_DB.tmp" && mv -f "$BENCH_DB.tmp" "$BENCH_DB"
+
+  # What to say about it. One dim line, printed where your eyes already are.
+  local now; now=$(fmt_us "$us")
+  if (( BENCH_RUNS == 1 )); then
+    printf '  \033[2m⏱ %s\033[0m\n' "$now"
+  elif (( us <= BENCH_BEST )); then
+    printf '  \033[2m⏱ %s  best yet — was %s (%s)\033[0m\n' \
+      "$now" "$(fmt_us "$BENCH_PREV")" "$(pct_delta "$BENCH_PREV" "$us")"
+  else
+    printf '  \033[2m⏱ %s  best %s (%s)\033[0m\n' \
+      "$now" "$(fmt_us "$BENCH_BEST")" "$(pct_delta "$BENCH_BEST" "$us")"
+  fi
+}
+
+# pct_delta <from> <to> -> "-45%" / "+97%"
+pct_delta() {
+  (( $1 > 0 )) || { printf '·'; return; }
+  local p=$(( ($2 - $1) * 100 / $1 ))
+  (( p > 0 )) && printf '+%d%%' "$p" || printf '%d%%' "$p"
+}
+
+# The kept times for one directory (default: where you are).
+cmd_times() {
+  local dir=${1:-$PWD} d c best runs last t rows=0
+  [[ -s $BENCH_DB ]] || { echo "No times recorded yet."; return 0; }
+  while IFS=$'\t' read -r d c best runs last t; do
+    [[ $d == "$dir" ]] || continue
+    (( rows++ == 0 )) && printf '%s\n' "$dir"
+    printf '  %-28s %8s  best of %s\n' "${c:0:28}" "$(fmt_us "$best")" "$runs"
+  done < <(sort -t$'\t' -k3,3n "$BENCH_DB" 2>/dev/null)
+  (( rows )) || echo "No times recorded in $dir."
 }
 
 HOOK_LINE="[[ -f \"$PLUGIN_DIR/shell/eevee-hook.bash\" ]] && source \"$PLUGIN_DIR/shell/eevee-hook.bash\" # eevee-buddy"
@@ -684,17 +933,17 @@ if [[ ${1:-} == ask || ${1:-} == open ]]; then # only chat needs the (jq) label
 fi
 SYSTEM_PROMPT="You are $NAME, a small, friendly Pokémon who lives at the bottom of the user's screen on an Omarchy Linux desktop (Arch Linux + Hyprland, Quickshell-based shell; Omarchy commands are under \`omarchy <group> <action>\`, sources in /usr/share/omarchy, user config in ~/.config). You are a genuinely useful assistant: answer questions, explain errors, diagnose the system, look things up.
 Rules:
-- Your reply is shown in a small speech bubble. Be brief: usually 1-4 short sentences, at most ~90 words. Plain text only: no markdown headings, tables, bold or \`\`\` code fences. Short inline \`code\` is fine; put a command the user should run on its own line.
+- Your reply is shown in a small speech bubble. Be brief: usually 1-3 short sentences, at most ~60 words. Plain text only: no markdown headings, tables, bold or \`\`\` code fences. Short inline \`code\` is fine; put a command the user should run on its own line.
+- No preamble. Never open by restating the question, narrating what you are about to do, or announcing a tool: no Let me check…, no Looking at your screen…, no Sure!. The first word is already part of the answer.
 - Be accurate. Use your tools (read files, read-only commands, web search) to check facts about this machine instead of guessing.
 - This is Arch Linux: prefer pacman/AUR packages (e.g. python-requests) or a venv/uv over a global pip install, and omarchy commands where one exists.
 - You CAN open apps and URLs for the user. To list installed apps run exactly: $SELF apps [filter]
   To open (or focus) one run exactly: $SELF launch \"<app name, .desktop id, or URL>\"
-  Do this whenever the user asks to open, launch, start, play or show something that an app or website handles, then confirm in a few words.
+  Do this whenever the user asks to open, launch, start, play or show something that an app or website handles. Say nothing about it afterwards: if launching was the whole request, reply with exactly OK and no other text — the window appearing is the answer. Only speak up if it failed or you had to pick between apps.
 - You can set reminders: run exactly: omarchy reminder <minutes> \"<message>\" (it arrives as a notification).
 - You have a memory across chats (listed in the prompt). When the user tells you a lasting fact or preference worth keeping, save it by running exactly: $SELF remember \"<fact>\"
 - If the prompt mentions a screenshot, Read that image file to see the user's screen before answering.
-- Apart from launching apps, reminders and memory, you cannot change the system. If something needs changing, tell the user the exact command to run.
-- A light touch of personality (an occasional cry of your own name, like 'Vee!' or 'Pika!') is welcome; never at the expense of usefulness."
+- Apart from launching apps, reminders and memory, you cannot change the system. If something needs changing, tell the user the exact command to run."
 
 ALLOWED_TOOLS=(
   Read Glob Grep WebSearch WebFetch
@@ -765,15 +1014,75 @@ User: $question"
   if [[ -z $answer ]]; then
     echo "Vee... I couldn't reach my brain just now. ($(head -c 160 "$RUN/ask.err" | tr '\n' ' '))"
   else
+    # A bare "OK" means "I only launched something": stay quiet, the window
+    # on screen already said it.
+    [[ ${answer//[[:space:].!]/} == [Oo][Kk] ]] && return 0
     # Bubble is plain text: drop code fences and markdown emphasis, squeeze blank lines.
     printf '%s\n' "$answer" | sed -E '/^[[:space:]]*```/d; s/\*\*([^*]+)\*\*/\1/g; s/^#+ //' | cat -s
   fi
+}
+
+# An area the user picked on screen (captured by the sprite, so the
+# thinking bubble isn't in it). Worded so cmd_ask doesn't grab the whole
+# screen as well.
+cmd_look() {
+  local file="$1"
+  [[ -s $file ]] || { echo "I couldn't capture that area."; return 0; }
+  cmd_ask "Here is an area I picked on my display. Read this image file to see it: $file
+Explain briefly what it shows and what matters. If it's an error, give the likely fix; if it isn't in English, translate it."
+  rm -f "$file"
+}
+
+# clip explain: say what's on the clipboard (text or image).
+# clip fix: correct the copied text and put the result back on the clipboard.
+cmd_clip() {
+  local mode="${1:-explain}" types type text file claude out fixed
+  enabled ai true || return 0
+  types=$(wl-paste --list-types 2>/dev/null)
+  type=$(grep -m1 '^image/\(png\|jpeg\|gif\|webp\)$' <<<"$types")
+  if [[ -n $type ]]; then
+    [[ $mode == fix ]] && { echo "That's an image on your clipboard; I can only fix text."; return 0; }
+    file="$RUN/clip.${type#image/}"
+    wl-paste --type "$type" >"$file" 2>/dev/null
+    cmd_ask "Here is an image I copied. Read this image file to see it: $file
+Explain briefly what it shows and what matters. If it's an error, give the likely fix."
+    rm -f "$file"; return
+  fi
+  text=$(wl-paste --no-newline --type text 2>/dev/null | head -c 20000)
+  [[ -n ${text//[[:space:]]/} ]] || { echo "Your clipboard is empty."; return 0; }
+
+  if [[ $mode != fix ]]; then
+    cmd_ask "Here is what I just copied:
+<<<
+$text
+>>>
+Explain it briefly: what it is and what matters. If it's an error or log, give the likely fix; if it isn't in English, translate it."
+    return
+  fi
+
+  # A plain, tool-less call: the answer is the corrected text and nothing else.
+  claude=$(find_claude) || { echo "I can't find the claude CLI."; return 0; }
+  cd "$STATE" || return 1
+  out=$(timeout 60 "$claude" -p --model "$CLAUDE_MODEL" \
+    --setting-sources project --strict-mcp-config --tools "" \
+    --output-format json \
+    -- "Fix the spelling, grammar and punctuation of the text between the markers, keeping its language, meaning, tone and formatting. Reply with only the corrected text, no quotes, markers or comments.
+<<<
+$text
+>>>" 2>"$RUN/ask.err")
+  fixed=$(jq -r '.result // empty' <<<"$out" 2>/dev/null)
+  [[ -n $fixed ]] || { echo "Vee... I couldn't reach my brain just now."; return 0; }
+  printf '%s' "$fixed" | wl-copy
+  if [[ $fixed == "$text" ]]; then echo "Looks good already, nothing to fix."
+  else printf 'Fixed and copied:\n%s\n' "$fixed"; fi
 }
 
 case "${1:-}" in
   sense) shift; cmd_sense "$@" ;;
   context) cmd_context ;;
   ask) shift; cmd_ask "$*" ;;
+  look) shift; cmd_look "${1:-}" ;;
+  clip) shift; cmd_clip "${1:-explain}" ;;
   evolve) shift; cmd_evolve "${1:-}" ;;
   devolve) cmd_evolve eevee ;;
   pet) cmd_pet ;;
@@ -782,6 +1091,9 @@ case "${1:-}" in
   lockscreen) shift; cmd_lockscreen "${1:-status}" ;;
   hover) cmd_hover ;;
   cmd-done) shift; cmd_done "$@" ;;
+  bench) shift; cmd_bench "$@" ;;
+  times) shift; cmd_times "${1:-$PWD}" ;;
+  explain-fail) shift; cmd_explain_fail "$@" ;;
   cmdhook) shift; cmd_cmdhook "${1:-status}" ;;
   form) form_now ;;
   launch) shift; cmd_launch "$*" ;;
