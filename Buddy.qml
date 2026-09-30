@@ -55,7 +55,8 @@ Item {
     benchmarks: true, benchmarkMs: 200, explainFailures: true, gitNudge: true,
     notifications: true, noteSeconds: 5, holdWhileAway: true, hideWhenSharing: true,
     ai: true, model: "claude-haiku-4-5", screenshots: true,
-    reactions: true, breakMinutes: 50, lateNight: true
+    reactions: true, breakMinutes: 50, lateNight: true, lateNightHour: 23,
+    translateUbuntu: true
   })
   property var saved: ({})
   readonly property var settings: {
@@ -358,6 +359,9 @@ Item {
     { icon: "󰆞", label: "Explain an area", fn: "look", ai: true },
     { icon: "󰅌", label: "Explain clipboard", fn: "clip", ai: true },
     { icon: "󰓆", label: "Fix clipboard text", fn: "fix", ai: true },
+    // A history clock, not a second clipboard: with the labels gone the
+    // glyph is all you get, and two clipboards read as the same button.
+    { icon: "󰋚", label: "Clipboard history", fn: "clipboard" },
     { icon: "󰔟", label: root.focusing ? "End focus" : "Focus 25 min", fn: "focus" },
     { icon: "󰒓", label: "Settings", fn: "settings" }
   ]
@@ -376,11 +380,24 @@ Item {
     else if (a.fn === "settings") root.openSettings()
     else if (a.fn === "clip") root.runBrain(["clip", "explain"])
     else if (a.fn === "fix") root.runBrain(["clip", "fix"])
+    else if (a.fn === "clipboard") clipboardDelay.restart()
     else if (a.fn === "look") lookDelay.restart()
   }
   // The area picker starts once the menu has gone; the capture happens
   // before she starts thinking, so her bubble isn't in the picture.
   Timer { id: lookDelay; interval: 200; onTriggered: if (!lookProc.running) lookProc.running = true }
+
+  // The clipboard history the rest of the system opens. The bar widget's own
+  // panel comes up at the pointer, right next to her, so try that first; if
+  // it isn't installed, `omarchy-shell <target> <method>` exits non-zero and
+  // we fall back to Omarchy's own (the same thing SUPER+CTRL+V toggles).
+  // Delayed a moment so the strip is gone before the overlay takes focus.
+  Timer {
+    id: clipboardDelay
+    interval: 180
+    onTriggered: Quickshell.execDetached(["bash", "-c",
+      "omarchy-shell iamcheyan.clipboard open >/dev/null 2>&1 || omarchy-menu-clipboard"])
+  }
   Process {
     id: lookProc
     readonly property string file: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/eevee/look.png"
@@ -1024,6 +1041,10 @@ Item {
       else root.startFocus(focus[1] || 25)
       return
     }
+    // /here reads the assignment in this folder; /english rewrites what you
+    // copied. Both answer in the bubble like any other question.
+    if (question === "/here") { root.runBrain(["here", ""]); return }
+    if (question === "/english") { root.runBrain(["clip", "english"]); return }
     var mem = question.match(/^\/(remember|forget)\s*(.*)$/i)
     if (mem) {
       Quickshell.execDetached(["bash", root.brain, mem[1].toLowerCase(), mem[2]])

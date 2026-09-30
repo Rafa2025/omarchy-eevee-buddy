@@ -18,6 +18,9 @@ __eevee_brain="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")/bin/
 __eevee_t=""
 __eevee_last=""      # the last command that failed, for `why`
 __eevee_last_dir=""
+__eevee_fail_cmd=""  # the same command failing over and over
+__eevee_fail_dir=""
+__eevee_fail_n=0
 
 # Expands to nothing; stamps __eevee_t in microseconds as the command starts.
 # EPOCHREALTIME carries the locale's decimal separator, so both are stripped.
@@ -35,6 +38,19 @@ __eevee_bench_shape() {
   return 1
 }
 
+# Commands a Debian/Ubuntu guide would tell you to run. Matching here keeps
+# the common case (your own command failed) free of a process spawn.
+__eevee_debianism() {
+  local c=$1
+  [[ $c == sudo\ * ]] && c=${c#sudo }
+  case ${c%% *} in
+    apt|apt-get|aptitude|dpkg|snap|add-apt-repository|apt-key|dnf|yum) return 0 ;;
+    service|update-alternatives|lsb_release) return 0 ;;
+    ifconfig|iwconfig|netstat|route) return 0 ;;
+  esac
+  return 1
+}
+
 __eevee_precmd() {
   local status=$? us cmd
   if [[ -n $__eevee_t ]]; then
@@ -46,6 +62,27 @@ __eevee_precmd() {
     if ((status != 0)); then
       __eevee_last=$cmd
       __eevee_last_dir=$PWD
+      # Guides are written for Ubuntu. If this looks like one of those
+      # commands, print the Arch equivalent while the failure is still on
+      # screen. Gated in-line so nothing else pays for a process.
+      if __eevee_debianism "$cmd"; then
+        bash "$__eevee_brain" fixcmd "$status" "$cmd" 2>/dev/null
+      fi
+
+      # Stuck: the same command, the same place, three times. Counted with
+      # shell variables so an ordinary failure never starts a process. It
+      # fires once, at exactly three, and then leaves you alone.
+      if [[ $cmd == "$__eevee_fail_cmd" && $PWD == "$__eevee_fail_dir" ]]; then
+        __eevee_fail_n=$((__eevee_fail_n + 1))
+      else
+        __eevee_fail_cmd=$cmd; __eevee_fail_dir=$PWD; __eevee_fail_n=1
+      fi
+      if ((__eevee_fail_n == 3)); then
+        printf '  \033[2m⤷ third time — let me look at that…\033[0m\n'
+        (bash "$__eevee_brain" explain-fail "$PWD" "$cmd" >/dev/null 2>&1 &)
+      fi
+    else
+      __eevee_fail_cmd=""; __eevee_fail_n=0
     fi
 
     # A timed run reports straight into the terminal, where you are looking.

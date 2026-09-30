@@ -173,13 +173,36 @@ active_window() {
   hyprctl activewindow -j 2>/dev/null | jq -r 'if .class then "\(.class) — \(.title)" else "desktop" end' 2>/dev/null
 }
 
+# What each window is actually showing: its title, the directory it is
+# running in, and the documents it holds open. A window class alone says
+# "code" and "evince"; this says which file and which PDF, with full paths,
+# so the answer can be about the thing on screen instead of about nothing.
+# Only the paths are listed -- nothing is read unless the question needs it.
+context_windows() {
+  local pid class title docs cwd doc
+  while IFS=$'\t' read -r pid class title; do
+    printf '  %s — %s\n' "$class" "$title"
+    cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)
+    [[ -n $cwd && $cwd != "$HOME" && $cwd != / ]] && printf '      running in: %s\n' "$cwd"
+    docs=""
+    while IFS= read -r doc; do docs+="        $doc"$'\n'; done < <(
+      ls -l "/proc/$pid/fd" 2>/dev/null \
+        | grep -oE "$HOME/[^ ]+" \
+        | grep -vE "/\.(config|local|cache|mozilla|var|pki|steam|vscode|vscode-shared|java|m2|gradle|npm)/|/\.git/" \
+        | grep -vE '\.(so|db|db-wal|db-shm|vscdb|log|sock|lock|tmp|journal)$' \
+        | sort -u | head -4 )
+    [[ -n $docs ]] && printf '      has open:\n%s' "$docs"
+  done < <(hyprctl clients -j 2>/dev/null | jq -r '.[] | "\(.pid)\t\(.class)\t\(.title)"' 2>/dev/null | head -12)
+}
+
 cmd_context() {
   local bat; bat=$(battery)
   read_load
   cat <<EOF
 Time: $(date '+%A %Y-%m-%d %H:%M')
 Focused window: $(active_window)
-Open windows: $(hyprctl clients -j 2>/dev/null | jq -r '[.[].class] | unique | join(", ")' 2>/dev/null)
+On screen (you may Read any of these paths if the question is about them):
+$(context_windows)
 Load (1m): $LOAD on $CORES cores; top CPU: $(top_cpu)
 Memory available: $(mem_avail_pct)%; top memory: $(top_mem)
 Root disk used: $(disk_pct)%
@@ -515,7 +538,12 @@ cmd_sense() {
     remind "Time for a break" "You've been at it for ${STREAK_MIN} minutes. Stretch, drink some water, and look at something 6 m away for 20 s."
   fi
 
-  if enabled lateNight true && (( hour >= 1 && hour < 5 && ACTIVE )) && cooldown latenight 14400; then
+  # The window runs from lateNightHour round to 05:00. It used to start at
+  # 01:00, which missed most of a 21:00-01:00 session entirely.
+  local lnh; lnh=$(setting lateNightHour 23)
+  local late=0
+  (( lnh >= 5 )) && { (( hour >= lnh || hour < 5 )) && late=1; } || { (( hour >= lnh && hour < 5 )) && late=1; }
+  if enabled lateNight true && (( late && ACTIVE )) && cooldown latenight 14400; then
     local hm; printf -v hm '%(%H:%M)T' -1
     remind "It's $hm" "Even $(species_label "$SPECIES") is asleep by now. Save your work and get some rest?"
   fi
@@ -688,6 +716,7 @@ cmd_done() {
   done
   local secs=$1 status=$2 spid=$3; shift 3
   local cmd="$*" min
+  [[ -n $dir && -d $dir ]] && printf '%s\n' "$dir" >"$STATE/lastdir"
   min=$(setting longCommandSeconds 30)
   (( min > 0 && secs >= min )) || return 0
   # Interactive programs aren't "jobs" you wait for.
@@ -797,6 +826,131 @@ cmd_explain_fail() {
 }
 
 # ---------------------------------------------------------------------------
+# Ubuntu guides on an Arch desktop. Course handouts and READMEs are written
+# for Debian, so `apt install`, `service`, `ifconfig … mode monitor` and
+# friends fail here. When one does, say the Omarchy/Arch equivalent straight
+# away, in the terminal, while the failed line is still on screen.
+#
+# Two signals, because both happen:
+#   - exit 127, the command does not exist at all (apt, dpkg, snap, service)
+#   - a legacy net tool that IS installed but was used the Debian way
+#     (`ifconfig wlan0 mode monitor` is not a thing on Linux)
+#
+# No AI: a table and pacman's own database answer instantly and offline.
+# ---------------------------------------------------------------------------
+
+# Debian package name -> Arch package name, for the ones course guides use.
+declare -A PKGMAP=(
+  [java-21-openjdk-devel]=jdk21-openjdk [java-17-openjdk-devel]=jdk17-openjdk
+  [java-21-openjdk]=jre21-openjdk [python3-devel]=python [postgresql-devel]=postgresql-libs
+  [@development-tools]=base-devel [redhat-rpm-config]=base-devel
+  [openjdk-21-jdk]=jdk21-openjdk [openjdk-21-jre]=jre21-openjdk
+  [openjdk-17-jdk]=jdk17-openjdk [openjdk-11-jdk]=jdk11-openjdk
+  [default-jdk]=jdk-openjdk [default-jre]=jre-openjdk
+  [build-essential]=base-devel [g++]=gcc [gcc-multilib]=gcc
+  [python3]=python [python3-pip]=python-pip [python3-dev]=python
+  [python3-venv]=python [python-is-python3]=python
+  [nodejs]=nodejs [npm]=npm
+  [docker.io]=docker [docker-compose]=docker-compose
+  [postgresql-client]=postgresql [libpq-dev]=postgresql-libs
+  [net-tools]=net-tools [wireless-tools]=wireless_tools
+  [iw]=iw [aircrack-ng]=aircrack-ng [tshark]=wireshark-cli
+  [wireshark-qt]=wireshark-qt [libssl-dev]=openssl [pkg-config]=pkgconf
+  [git]=git [curl]=curl [wget]=wget [make]=make [cmake]=cmake
+  [maven]=maven [gradle]=gradle [ffmpeg]=ffmpeg [imagemagick]=imagemagick
+)
+
+# arch_pkg <debian name>: the Arch name, the same name when it exists in the
+# repos, otherwise the name unchanged (pacman will suggest the rest).
+arch_pkg() {
+  local p=$1
+  [[ -n ${PKGMAP[$p]-} ]] && { printf '%s' "${PKGMAP[$p]}"; return; }
+  # -Si hits the local sync database, no network.
+  if pacman -Si -- "$p" >/dev/null 2>&1; then printf '%s' "$p"; return; fi
+  # Debian often prefixes lib…-dev; Arch ships the plain package.
+  local s=${p#lib}; s=${s%-dev}; s=${s%-devel}
+  if [[ $s != "$p" ]] && pacman -Si -- "$s" >/dev/null 2>&1; then printf '%s' "$s"; return; fi
+  printf '%s' "$p"
+}
+
+# Drop apt's flags, keep the package names.
+apt_pkgs() {
+  local out=() a
+  for a in "$@"; do
+    case $a in -*|install|remove|purge|reinstall) continue ;; esac
+    out+=("$(arch_pkg "$a")")
+  done
+  printf '%s' "${out[*]}"
+}
+
+# cmd_fixcmd <status> <command...>: one suggestion line, or nothing.
+cmd_fixcmd() {
+  local status=${1:-0}; shift
+  local cmd="$*" bin sub rest pkgs iface
+  enabled translateUbuntu true || return 0
+  (( status != 0 )) || return 0
+  [[ -n $cmd ]] || return 0
+
+  # Strip a leading sudo so the table only matches the real command.
+  local bare=$cmd
+  [[ $bare == sudo\ * ]] && bare=${bare#sudo }
+  bin=${bare%% *}; rest=${bare#"$bin"}; rest=${rest# }
+  sub=${rest%% *}
+
+  local fix=""
+  case $bin in
+    apt|apt-get|aptitude)
+      case $sub in
+        install|reinstall) pkgs=$(apt_pkgs $rest); fix="sudo pacman -S --needed $pkgs" ;;
+        remove)            pkgs=$(apt_pkgs $rest); fix="sudo pacman -R $pkgs" ;;
+        purge|autoremove)  pkgs=$(apt_pkgs $rest); fix="sudo pacman -Rns ${pkgs:-<package>}" ;;
+        update)            fix="sudo pacman -Sy" ;;
+        upgrade|full-upgrade|dist-upgrade) fix="sudo pacman -Syu   # or: omarchy update" ;;
+        search)            fix="pacman -Ss ${rest#search }" ;;
+        show|info)         fix="pacman -Si ${rest#"$sub" }" ;;
+        list)              fix="pacman -Q" ;;
+        *)                 fix="sudo pacman -S --needed $(apt_pkgs $rest)" ;;
+      esac ;;
+    dpkg)
+      case $rest in
+        -i*) fix="Arch can't install a .deb — find it in the repos (pacman -Ss <name>) or the AUR (yay -S <name>)" ;;
+        -l*) fix="pacman -Q" ;;
+        -L*) fix="pacman -Ql ${rest#-L }" ;;
+        -S*) fix="pacman -Qo ${rest#-S }" ;;
+        *)   fix="pacman -Q" ;;
+      esac ;;
+    snap)      fix="yay -S ${rest#install }   # AUR, or: flatpak install ${rest#install }" ;;
+    add-apt-repository|apt-key)
+      fix="Arch has no PPAs — the AUR replaces them:  yay -S <package>" ;;
+    dnf|yum)   fix="sudo pacman -S --needed $(apt_pkgs $rest)" ;;
+    service)
+      # service <name> <action>  ->  systemctl <action> <name>
+      local name=$sub action=${rest#"$sub" }
+      fix="sudo systemctl ${action:-status} $name" ;;
+    update-alternatives)
+      fix="archlinux-java status     # and: sudo archlinux-java set <java-21-openjdk>" ;;
+    lsb_release) fix="cat /etc/os-release   # or: omarchy version" ;;
+    # Installed, but used the Debian way. Only worth a word when it failed.
+    ifconfig|iwconfig)
+      iface=$sub
+      case $rest in
+        *"mode monitor"*)  fix="sudo iw dev $iface set type monitor      # ifconfig/iwconfig cannot do this" ;;
+        *"mode managed"*)  fix="sudo iw dev $iface set type managed" ;;
+        *" up")            fix="sudo ip link set $iface up" ;;
+        *" down")          fix="sudo ip link set $iface down" ;;
+        *"channel"*)       fix="sudo iw dev $iface set channel ${rest##*channel }" ;;
+        "")                fix="ip addr        # iwconfig -> iw dev" ;;
+        *)                 fix="ip addr / ip link, and iw dev for wireless" ;;
+      esac ;;
+    netstat)   fix="ss ${rest:--tulpn}" ;;
+    route)     fix="ip route" ;;
+  esac
+
+  [[ -n $fix ]] || return 0
+  printf '  \033[2m⤷ Omarchy is Arch:\033[0m \033[1m%s\033[0m\n' "$fix"
+}
+
+# ---------------------------------------------------------------------------
 # Benchmark memory. Commands that are really "run this and see how fast it
 # is" -- ./a.out, make, mvn, cargo -- get their time kept per directory, so
 # the next run can say whether it got faster. The AAD makefiles ask you to
@@ -834,6 +988,7 @@ cmd_bench() { # cmd_bench <microseconds> <status> <dir> <command...>
   (( status == 0 )) || return 0          # a crash is not a measurement
   # Below the floor the measurement is mostly process start-up, and every
   # small compile would print a line. 200 ms by default; benchmarkMs moves it.
+  [[ -d $dir ]] && printf '%s\n' "$dir" >"$STATE/lastdir"
   local floor; floor=$(setting benchmarkMs 200)
   (( us >= floor * 1000 )) || return 0
 
@@ -859,15 +1014,25 @@ cmd_bench() { # cmd_bench <microseconds> <status> <dir> <command...>
   printf '%s' "$kept" >"$BENCH_DB.tmp" && mv -f "$BENCH_DB.tmp" "$BENCH_DB"
 
   # What to say about it. One dim line, printed where your eyes already are.
-  local now; now=$(fmt_us "$us")
+  local now key; now=$(fmt_us "$us"); key=$(bench_key "$dir" "$cmd")
   if (( BENCH_RUNS == 1 )); then
     printf '  \033[2m⏱ %s\033[0m\n' "$now"
+    bench_snapshot "$key" "$dir"
   elif (( us <= BENCH_BEST )); then
     printf '  \033[2m⏱ %s  best yet — was %s (%s)\033[0m\n' \
       "$now" "$(fmt_us "$BENCH_PREV")" "$(pct_delta "$BENCH_PREV" "$us")"
+    bench_snapshot "$key" "$dir"   # this is the version to beat from now on
   else
     printf '  \033[2m⏱ %s  best %s (%s)\033[0m\n' \
       "$now" "$(fmt_us "$BENCH_BEST")" "$(pct_delta "$BENCH_BEST" "$us")"
+    # Only a regression worth explaining: 20% off the best and at least 150 ms,
+    # so ordinary run-to-run jitter stays quiet.
+    if (( us > BENCH_BEST * 120 / 100 && us - BENCH_BEST > 150000 )); then
+      if bench_diff "$key" "$dir" >/dev/null 2>&1; then
+        printf '  \033[2m⤷ slower than your best — asking why…\033[0m\n'
+        bench_explain_regression "$key" "$dir" "$cmd" "$us" "$BENCH_BEST"
+      fi
+    fi
   fi
 }
 
@@ -876,6 +1041,58 @@ pct_delta() {
   (( $1 > 0 )) || { printf '·'; return; }
   local p=$(( ($2 - $1) * 100 / $1 ))
   (( p > 0 )) && printf '+%d%%' "$p" || printf '%d%%' "$p"
+}
+
+# ---------------------------------------------------------------------------
+# Why it got slower. None of the course folders are git repositories, so when
+# a run regresses there is nothing to compare against -- which makes her copy
+# of the source behind the best time the only record of the fast version.
+# The sources are a few kilobytes, so keeping one costs nothing.
+# ---------------------------------------------------------------------------
+BENCH_SRC="$STATE/bench-src"
+
+# A stable directory name for one (directory, command) pair.
+bench_key() { printf '%s' "$(printf '%s\t%s' "$1" "$2" | cksum | tr -d ' ')"; }
+
+# The source files of a directory: small, top level, the ones a run compiles.
+bench_sources() {
+  local d=$1 f
+  for f in "$d"/*.{c,h,cc,cpp,hpp,java,py,rs,go,f90,f95,zig,ts,js,sql}; do
+    [[ -f $f ]] && printf '%s\n' "$f"
+  done 2>/dev/null
+}
+
+# Keep the source that produced a new best time.
+bench_snapshot() {
+  local key=$1 dir=$2 dest="$BENCH_SRC/$key" f
+  rm -rf "$dest"; mkdir -p "$dest" || return 0
+  while IFS= read -r f; do cp -f "$f" "$dest/" 2>/dev/null; done < <(bench_sources "$dir")
+  # Nothing to keep is fine; the diff simply never fires.
+  rmdir "$dest" 2>/dev/null || :
+}
+
+# A unified diff of the current sources against the fastest ones, or nothing.
+bench_diff() {
+  local key=$1 dir=$2 snap="$BENCH_SRC/$key" tmp f out
+  [[ -d $snap ]] || return 1
+  tmp=$(mktemp -d "$RUN/benchdiff.XXXXXX") || return 1
+  while IFS= read -r f; do cp -f "$f" "$tmp/" 2>/dev/null; done < <(bench_sources "$dir")
+  out=$(diff -ru --label fastest --label now "$snap" "$tmp" 2>/dev/null | head -c 12000)
+  rm -rf "$tmp"
+  [[ -n $out ]] || return 1
+  printf '%s' "$out"
+}
+
+# Ask why, in the background, and answer in her bubble: the terminal already
+# has its prompt back by the time Claude replies.
+bench_explain_regression() { # <key> <dir> <cmd> <now us> <best us>
+  local key=$1 dir=$2 cmd=$3 now=$4 best=$5 d file
+  enabled ai true || return 0
+  d=$(bench_diff "$key" "$dir") || return 0
+  file="$RUN/slower.diff"
+  printf '%s\n' "$d" >"$file"
+  local q="\`$cmd\` in $dir just took $(fmt_us "$now"), against a best of $(fmt_us "$best"). $file is a unified diff of the source as it is now against the copy that produced that best time (label 'fastest' is the fast one, 'now' is current). Read it and say, in two sentences, which change most likely cost the time and what to put back. If the diff cannot explain a slowdown that size, say it looks like measurement noise instead."
+  omarchy-shell "$PLUGIN_IPC" ask "$q" >/dev/null 2>&1 &
 }
 
 # The kept times for one directory (default: where you are).
@@ -1041,7 +1258,7 @@ cmd_clip() {
   types=$(wl-paste --list-types 2>/dev/null)
   type=$(grep -m1 '^image/\(png\|jpeg\|gif\|webp\)$' <<<"$types")
   if [[ -n $type ]]; then
-    [[ $mode == fix ]] && { echo "That's an image on your clipboard; I can only fix text."; return 0; }
+    [[ $mode == fix || $mode == english ]] && { echo "That's an image on your clipboard; I can only work on text."; return 0; }
     file="$RUN/clip.${type#image/}"
     wl-paste --type "$type" >"$file" 2>/dev/null
     cmd_ask "Here is an image I copied. Read this image file to see it: $file
@@ -1050,6 +1267,8 @@ Explain briefly what it shows and what matters. If it's an error, give the likel
   fi
   text=$(wl-paste --no-newline --type text 2>/dev/null | head -c 20000)
   [[ -n ${text//[[:space:]]/} ]] || { echo "Your clipboard is empty."; return 0; }
+
+  [[ $mode == english ]] && { clip_english "$text"; return; }
 
   if [[ $mode != fix ]]; then
     cmd_ask "Here is what I just copied:
@@ -1077,6 +1296,91 @@ $text
   else printf 'Fixed and copied:\n%s\n' "$fixed"; fi
 }
 
+# ---------------------------------------------------------------------------
+# "What am I supposed to do here?" The assignment PDF sits in the same folder
+# as the code, and nothing connects the two. She reads the handout, looks at
+# what builds and what you have already run, and says what is left.
+# ---------------------------------------------------------------------------
+cmd_here() {
+  local dir=${1:-} pdf doc built ran targets
+  enabled ai true || { echo "Turn AI on and I can read the handout for you."; return 0; }
+  # Asked from her chat box there is no directory to inherit, so fall back to
+  # the last one the shell hook reported working in.
+  [[ -n $dir ]] || readf dir "$STATE/lastdir"
+  [[ -n $dir && -d $dir ]] || dir=$PWD
+
+  # The handout: a PDF or markdown here, else one directory up (P1/P2/P3
+  # sit under a course folder that sometimes holds the brief).
+  doc=$(find "$dir" -maxdepth 1 -type f \( -iname '*.pdf' -o -iname '*.md' \) 2>/dev/null | head -1)
+  [[ -n $doc ]] || doc=$(find "$dir/.." -maxdepth 1 -type f -iname '*.pdf' 2>/dev/null | head -1)
+
+  targets=$(sed -n 's/^\([A-Za-z0-9_.-]\+\):.*/\1/p' "$dir"/[Mm]akefile 2>/dev/null | paste -sd' ')
+  built=$(find "$dir" -maxdepth 1 -type f -executable -not -name '*.*' 2>/dev/null \
+          | xargs -r -n1 basename | paste -sd' ')
+  ran=$(awk -F'\t' -v d="$dir" '$1 == d { printf "%s (best %.2fs, %s runs)\n", $2, $3/1000000, $4 }' \
+        "$BENCH_DB" 2>/dev/null | head -8)
+
+  cmd_ask "I'm working in $dir. Tell me what is left to do here.
+${doc:+The assignment is $doc — Read that file first.}
+Makefile targets: ${targets:-none}
+Already compiled: ${built:-nothing}
+Runs I have timed here:
+${ran:-none yet}
+Also list the source files yourself and check which parts of the assignment they already cover. Answer as a short list of what is done and what is still missing — no preamble."
+}
+
+# ---------------------------------------------------------------------------
+# A commit message drafted from the diff, in the voice of the ones already in
+# the log. Prints it; nothing is committed.
+# ---------------------------------------------------------------------------
+cmd_commitmsg() {
+  local dir=${1:-$PWD} diff style claude out
+  enabled ai true || return 0
+  git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || { echo "$dir isn't a git repository."; return 0; }
+  diff=$(git -C "$dir" diff --cached 2>/dev/null | head -c 24000)
+  [[ -n $diff ]] || diff=$(git -C "$dir" diff 2>/dev/null | head -c 24000)
+  [[ -n $diff ]] || { echo "Nothing changed to describe."; return 0; }
+  # Their own last few messages carry the house style better than any rule.
+  style=$(git -C "$dir" log -6 --format='%s%n%b---' 2>/dev/null | head -c 4000)
+
+  claude=$(find_claude) || { echo "I can't find the claude CLI."; return 0; }
+  cd "$STATE" || return 1
+  out=$(timeout 90 "$claude" -p --model "$CLAUDE_MODEL" \
+    --setting-sources project --strict-mcp-config --tools "" \
+    --output-format json \
+    -- "Write the commit message for this diff, matching the style of the existing messages below (sentence-case subject, no conventional-commit prefix, a prose body explaining why when the change needs it). Reply with only the message. Do not add any Co-Authored-By or generated-by trailer.
+
+Existing messages:
+$style
+
+Diff:
+$diff" 2>"$RUN/ask.err")
+  jq -r '.result // empty' <<<"$out" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# The clipboard, rewritten as English that reads naturally. Separate from the
+# spelling fix: this one is allowed to reshape a sentence, and it translates
+# when what you copied isn't English.
+# ---------------------------------------------------------------------------
+clip_english() {
+  local text=$1 claude out fixed
+  claude=$(find_claude) || { echo "I can't find the claude CLI."; return 0; }
+  cd "$STATE" || return 1
+  out=$(timeout 60 "$claude" -p --model "$CLAUDE_MODEL" \
+    --setting-sources project --strict-mcp-config --tools "" \
+    --output-format json \
+    -- "Rewrite the text between the markers as clear, natural English, keeping its meaning, register and formatting. If it is not in English, translate it. Do not add or remove information, and do not make it more formal than it already is. Reply with only the rewritten text.
+<<<
+$text
+>>>" 2>"$RUN/ask.err")
+  fixed=$(jq -r '.result // empty' <<<"$out" 2>/dev/null)
+  [[ -n $fixed ]] || { echo "Vee... I couldn't reach my brain just now."; return 0; }
+  printf '%s' "$fixed" | wl-copy
+  if [[ $fixed == "$text" ]]; then echo "That already reads well."
+  else printf 'In English, copied:\n%s\n' "$fixed"; fi
+}
+
 case "${1:-}" in
   sense) shift; cmd_sense "$@" ;;
   context) cmd_context ;;
@@ -1092,6 +1396,9 @@ case "${1:-}" in
   hover) cmd_hover ;;
   cmd-done) shift; cmd_done "$@" ;;
   bench) shift; cmd_bench "$@" ;;
+  fixcmd) shift; cmd_fixcmd "$@" ;;
+  here) shift; cmd_here "${1:-$PWD}" ;;
+  commitmsg) shift; cmd_commitmsg "${1:-$PWD}" ;;
   times) shift; cmd_times "${1:-$PWD}" ;;
   explain-fail) shift; cmd_explain_fail "$@" ;;
   cmdhook) shift; cmd_cmdhook "${1:-status}" ;;

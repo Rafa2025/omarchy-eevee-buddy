@@ -48,7 +48,14 @@ Everything Omarchy ships, plus:
 | Drag | Move her |
 | Drop a file | She reads it and explains it |
 
-In the chat box: `/settings`, `/attack`, `/focus [minutes]` (holds notifications until the end), `/focus off`, `/remember <fact>`, `/forget [text]`, `/evolve [form]`, `/devolve`, `/reset`.
+In the chat box: `/here` (read the assignment in the folder you are working in
+and say what is left), `/english` (rewrite what you copied as natural English,
+translating if needed), `/settings`, `/attack`, `/focus [minutes]` (holds
+notifications until the end), `/focus off`, `/remember <fact>`, `/forget
+[text]`, `/evolve [form]`, `/devolve`, `/reset`.
+
+From a terminal: `eevee-brain here` and `eevee-brain commitmsg`, which drafts a
+commit message from the diff in the voice of the ones already in the log.
 
 From scripts or keybindings:
 
@@ -102,9 +109,70 @@ redirection, a pipe, `sudo`, `rm`, `git push` or `docker` is explained from the
 command alone instead. The notification for a failed long command does the same
 thing when you click it.
 
+**Guides written for Ubuntu.** Course handouts and READMEs assume Debian, so
+`apt install`, `service`, `dpkg` and `ifconfig … mode monitor` fail here. When
+one does, she prints the Arch equivalent while the failed line is still on
+screen — from a table and pacman's own database, so it is instant and offline:
+
+```
+$ sudo apt install -y openjdk-21-jdk maven
+bash: apt: command not found
+  ⥤ Omarchy is Arch: sudo pacman -S --needed jdk21-openjdk maven
+
+$ sudo ifconfig wlan0 mode monitor
+  ⥤ Omarchy is Arch: sudo iw dev wlan0 set type monitor
+```
+
+Debian *and* Fedora package names are mapped (guides print both), and a command
+that succeeds is never second-guessed — `netstat` works here, so it is left
+alone. Set `translateUbuntu` to false to turn it off.
+
+**Why it got slower.** She keeps a copy of the source behind each best time,
+so when a run regresses (20% off the best and at least 150 ms) she diffs your
+code against the version that was fast and says what cost the time. Course
+folders are rarely git repositories, so often that copy is the only record of
+the fast version. If nothing in the source changed, she stays quiet — that is
+jitter, not a regression.
+
+```
+$ ./reduction
+  ⏱ 5.00s  best 2.00s (+150%)
+  ⥤ slower than your best — asking why…
+      (in her bubble) reduction lets each thread accumulate privately then
+      merge at the end. Put the `reduction(+:sum)` clause back on the
+      parallel for.
+```
+
+**Stuck on something.** The same command failing three times in the same
+directory and she looks at it herself, instead of waiting for you to type
+`why`. Once, at the third try; a success resets the count. The counting is
+plain shell variables, so an ordinary failure never starts a process.
+
 **Uncommitted work.** Every few hours she checks the repositories you work in
 and mentions one that has been sitting dirty for a couple of hours — never one
 you are still editing. Hidden trees, caches and `node_modules` are skipped.
+
+## She can see what you are working on
+
+Her desktop snapshot lists, for every window, its title, the directory it is
+running in and the full paths of the documents it holds open — read from
+`/proc`, so it is the real file, not a guess from a title. With an editor and
+the handout side by side that is enough to answer a question with no nouns in
+it:
+
+```
+code   — reduction.c - P3 - Visual Studio Code
+           running in: ~/Documents/MECT/AAD/P3
+evince — AAD_P3.pdf
+           has open: ~/Documents/MECT/AAD/P3/AAD_P3.pdf
+
+you: what is this asking me to do?
+her: You're on section 4 (Reduction). Compile and run reduction.c, then
+     modify it so the reduction returns the minimum and maximum instead
+     of the sum.
+```
+
+Only paths are listed. A file is opened only when your question is about it.
 
 ## Settings
 
@@ -115,7 +183,7 @@ Settings are saved Omarchy's way, inline on the plugin's entry in `~/.config/oma
 ## Privacy
 
 - **Notifications:** she reads them from the session bus. While she's delivering them, Omarchy's Do Not Disturb is on, so its popups stay quiet and everything still goes to the notification history. Turning the setting off (or disabling the plugin) switches Do Not Disturb back off.
-- **What reaches Claude:** only what you ask her, plus a small snapshot of the desktop (load, memory, open apps). Screenshots and files are sent only when you ask about your screen or drop a file on her.
+- **What reaches Claude:** only what you ask her, plus a small snapshot of the desktop (load, memory, and for each window its title, its working directory and the paths of the documents it has open — paths only; a file is read only if your question is about it). Screenshots and files are sent only when you ask about your screen or drop a file on her.
 - **Long commands:** the hook sees command lines only to name them in the notification and to keep their run times locally (`~/.local/state/eevee/bench`); they never leave your machine.
 - **`why` and failure explanations:** these do send the command and the output of re-running it to Claude, because that is the question. Nothing is sent until you ask, by typing `why` or clicking the notification.
 
